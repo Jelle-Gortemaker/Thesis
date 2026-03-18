@@ -12,21 +12,13 @@ def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0):
     surface_ds = ds_resampled.isel(depth=depth_idx, time=time_idx)
     return surface_ds
 
-def get_subdomain(center_lat, center_lon):
+def get_subdomain(lat_min, lon_min, lat_max, lon_max):
     """
-    Calculates the lat/lon bounds for an exact 200x200 km box.
-    100km in each direction from center.
+    Simply returns the manual bounds in the [lon_min, lon_max, lat_min, lat_max] 
+    format expected by the plotting and slicing functions.
     """
-    R = 6371.0  # Earth radius in km
-    
-    # Latitude offset (constant: 1 deg lat approx 111km)
-    lat_offset = (100.0 / R) * (180.0 / np.pi)
-    
-    # Longitude offset (shrinks as you move away from equator)
-    lon_offset = (100.0 / (R * np.cos(np.deg2rad(center_lat)))) * (180.0 / np.pi)
-    
-    return [center_lon - lon_offset, center_lon + lon_offset, 
-            center_lat - lat_offset, center_lat + lat_offset]
+    return [lon_min, lon_max, lat_min, lat_max]
+
 
 def calculate_coriolis_beta_plane(ds_slice):
     """
@@ -135,23 +127,24 @@ def plot_ocean_field(data, u=None, v=None, title="", cmap='viridis', label="", t
                   color='black', alpha=0.4, scale=vector_scale, transform=ccrs.PlateCarree())
     
     if target_box is not None:
-        # Drawing the 200km box
-        width = target_box[1] - target_box[0]
-        height = target_box[3] - target_box[2]
-        rect = patches.Rectangle((target_box[0], target_box[2]), width, height,
+        # target_box is [lon_min, lon_max, lat_min, lat_max]
+        lon_min, lon_max, lat_min, lat_max = target_box
+        
+        # Calculate width and height in degrees for the rectangle patch
+        width = lon_max - lon_min
+        height = lat_max - lat_min
+        
+        rect = patches.Rectangle((lon_min, lat_min), width, height,
                                  linewidth=3, edgecolor='red', facecolor='none', 
                                  transform=ccrs.PlateCarree(), zorder=10)
         ax.add_patch(rect)
         
-        # FIX: Explicitly naming x, y, and s to avoid positional argument mismatch
-        ax.text(x=target_box[0], 
-                y=target_box[3] + 0.15, 
-                s="LES Study Area (200km)", 
-                color='red', fontweight='bold', 
-                transform=ccrs.PlateCarree())
+        ax.text(x=lon_min, y=lat_max + 0.1, s="Target Box", 
+                color='red', fontweight='bold', transform=ccrs.PlateCarree())
 
     plt.title(title)
     plt.show()
+
 
 def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=None):
     """Specialized plot for cyclonic vs anticyclonic cores."""
@@ -166,3 +159,148 @@ def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=Non
         robust=True,
         vector_scale=15
     )
+
+
+def calculate_EDS(filepath, target_box, max_wavelength_km=800.0):
+    """
+    Validated EDS: Returns the pre-multiplied spectrum E(l) in units of m²/s².
+    This allows direct comparison with energy-scale reference slopes.
+    """
+    ds = xr.open_dataset(filepath)
+    box_ds = ds.sel(longitude=slice(target_box[0], target_box[1]),
+                    latitude=slice(target_box[2], target_box[3])).isel(depth=0)
+
+    # 1. Grid Metrics
+    R_earth = 6371000.0  
+    phi_lat = float(box_ds.latitude.mean())
+    dy = np.deg2rad(np.abs(np.mean(np.gradient(box_ds.latitude.values)))) * R_earth
+    dx = np.deg2rad(np.abs(np.mean(np.gradient(box_ds.longitude.values)))) * R_earth * np.cos(np.deg2rad(phi_lat))
+
+    n_lat, n_lon = len(box_ds.latitude), len(box_ds.longitude)
+    nt = n_lat * n_lon # Total pixels
+
+    # 2. Spectral Bins
+    f_nyquist = 1.0 / (2.0 * max(dx, dy))
+    k_min = 1.0 / (max_wavelength_km * 1000.0)
+    k_bins = np.logspace(np.log10(k_min), np.log10(f_nyquist), num=41)
+    k_centers = (k_bins[:-1] * k_bins[1:])**0.5
+    dk = np.diff(k_bins) 
+
+    # 3. Wavenumber Grid
+    freq_x = np.fft.fftshift(np.fft.fftfreq(n_lon, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(n_lat, d=dy))
+    KX, KY = np.meshgrid(freq_x, freq_y)
+    K_radial = np.sqrt(KX**2 + KY**2) 
+    indices = np.digitize(K_radial, k_bins)
+    
+    all_daily_spectra = []
+    for t in range(len(box_ds.time)):
+        u = box_ds.uo.isel(time=t).values
+        v = box_ds.vo.isel(time=t).values
+        
+        # FFT Normalization: Standard Parseval normalization (1/nt)
+        u_fft = np.fft.fftshift(np.fft.fft2(u - np.nanmean(u))) / nt
+        v_fft = np.fft.fftshift(np.fft.fft2(v - np.nanmean(v))) / nt
+        
+        # Power Spectral Density (Energy per mode)
+        psd_2d = 0.5 * (np.abs(u_fft)**2 + np.abs(v_fft)**2)
+        
+        # 4. Integration to 1D Density E(k)
+        daily_eds = []
+        for i in range(1, len(k_bins)):
+            mask = (indices == i)
+            if np.any(mask):
+                # Calculate E(k) density (Sum energy in bin / bin width)
+                Ek_density = np.sum(psd_2d[mask]) / dk[i-1]
+                
+                # CONVERSION TO E(l): Multiply by k to get energy magnitude (m²/s²)
+                # This aligns the data with standard reference slope levels
+                daily_eds.append(Ek_density * k_centers[i-1])
+            else:
+                daily_eds.append(np.nan)
+        all_daily_spectra.append(daily_eds)
+
+    return xr.DataArray(np.nanmean(all_daily_spectra, axis=0), 
+                        coords=[("characteristic_length", 1.0 / k_centers)], 
+                        name="energy_density").dropna(dim="characteristic_length")
+
+
+
+def calculate_EDS_alternative(filepath, target_box, max_wavelength_km=400.0):
+    """
+    Alternative EDS calculation following the scalar-KE FFT logic.
+    Compatible with the user's data slicing and averaging workflow.
+    """
+    ds = xr.open_dataset(filepath)
+    
+    # Selection using index for depth and manual slice for box
+    box_ds = ds.sel(
+        longitude=slice(target_box[0], target_box[1]),
+        latitude=slice(target_box[2], target_box[3])
+    ).isel(depth=0)
+
+    # 1. Determine Physical Grid Metrics (Thesis Eq. 5) [cite: 280]
+    R_earth = 6371000.0  
+    phi_lat = float(box_ds.latitude.mean())
+    dlat_deg = np.abs(np.mean(np.gradient(box_ds.latitude.values)))
+    dlon_deg = np.abs(np.mean(np.gradient(box_ds.longitude.values)))
+    
+    dy = np.deg2rad(dlat_deg) * R_earth
+    dx = np.deg2rad(dlon_deg) * R_earth * np.cos(np.deg2rad(phi_lat))
+
+    nx, ny = len(box_ds.latitude), len(box_ds.longitude)
+
+    # 2. Wavenumber Axes and Grid
+    kx = np.fft.fftfreq(nx, d=dx)  
+    ky = np.fft.fftfreq(ny, d=dy) 
+    kx_grid, ky_grid = np.meshgrid(kx, ky, indexing='ij')
+    k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
+
+    # 3. Bin Definition (Alternative Logic)
+    valid_k = k_mag > 0
+    k_min = 1.0 / (max_wavelength_km * 1000.0)
+    # Using 40 bins as per alternative logic
+    k_bins = np.logspace(np.log10(k_min), np.log10(k_mag.max()), num=41)
+    k_centers = (k_bins[:-1] * k_bins[1:])**0.5
+    
+    all_daily_spectra = []
+
+    # 4. Processing Loop: Snapshot-by-snapshot
+    for t in range(len(box_ds.time)):
+        u = box_ds.uo.isel(time=t).values
+        v = box_ds.vo.isel(time=t).values
+
+        # Alternative Step: Compute Kinetic Energy field in physical space first
+        # Normalized by grid size as per alternative script logic
+        E_l = 0.5 * (np.abs(u)**2 + np.abs(v)**2) / (nx * ny)
+
+        # Alternative Step: FFT of the scalar KE field
+        E_k = np.abs(np.fft.fft2(E_l))
+        
+        # Binning logic
+        E_spectrum = np.zeros(len(k_bins)-1)
+        N_modes = np.zeros(len(k_bins)-1)
+        
+        for k in range(len(k_bins)-1):
+            mask_bin = (k_mag >= k_bins[k]) & (k_mag < k_bins[k+1])
+            E_spectrum[k] = np.sum(E_k[mask_bin])
+            N_modes[k] = np.sum(mask_bin)
+
+        # Average by modes in each bin
+        valid_bins = N_modes > 0
+        E_spectrum[valid_bins] /= N_modes[valid_bins]
+        all_daily_spectra.append(E_spectrum)
+
+    # 5. Averaging snapshots over the month [cite: 207]
+    mean_eds = np.nanmean(all_daily_spectra, axis=0)
+    
+    # 6. Apply Nyquist Cutoff (Thesis Eq. 7) [cite: 292]
+    f_nyquist = 1.0 / (2.0 * max(dx, dy))
+    nyq_mask = (k_centers <= f_nyquist)
+
+    return xr.DataArray(
+        mean_eds[nyq_mask],
+        coords=[("characteristic_length", 1.0 / k_centers[nyq_mask])],
+        name="energy_density",
+        attrs={"nyquist_km": (1.0/f_nyquist)/1000.0}
+    ).dropna(dim="characteristic_length")
