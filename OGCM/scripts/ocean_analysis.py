@@ -162,54 +162,101 @@ def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=Non
         vector_scale=15
     )
 
-def preprocess_netcdf(input_path, les_box, active=True):
+def preprocess_netcdf(surface_ds, les_box, active=True, subtract_mean=False):
     """
-    Slices GLORYS data and transforms it into a format directly compatible 
-    with the 'dns' file_type in VortexFitting.
+    Slice GLORYS data and save it in a format compatible with
+    VortexFitting's current `file_type='dns'` reader.
     """
+
     if not active:
         print("Vortex box saving is DEACTIVATED.")
         return None
 
-    # 1. Load the dataset
-    ds = xr.open_dataset(input_path)
+    # 1. Use the passed surface_ds directly
+    ds = surface_ds
 
-    # 2. Spatial Slicing
+    # 2. Slice requested box
     lon_w, lon_e, lat_s, lat_n = les_box
-    sliced_ds = ds.sel(longitude=slice(lon_w, lon_e), latitude=slice(lat_s, lat_n))
+    sliced = ds.sel(longitude=slice(lon_w, lon_e), latitude=slice(lat_s, lat_n))
 
-    # 3. Cartesian Coordinate Conversion (Degrees to Meters)
-    # VortexFitting requires a uniform spatial mesh in a Cartesian referential [cite: 81]
-    R = 6371000.0  # Earth's radius in meters
-    mean_lat = sliced_ds.latitude.mean()
-    
-    # Calculate relative x and y in meters
-    x_m = (sliced_ds.longitude - sliced_ds.longitude[0]) * (np.pi/180.0) * R * np.cos(np.deg2rad(mean_lat))
-    y_m = (sliced_ds.latitude - sliced_ds.latitude[0]) * (np.pi/180.0) * R
+    # 3. Ensure time dimension exists
+    if "time" not in sliced.dims:
+        sliced = sliced.expand_dims(time=[0])
 
-    # 4. Rename and Reformat for 'dns' Compatibility
-    # The tool expects velocity_x, velocity_y, and velocity_z
-    # It also expects a time dimension for indexing
-    compat_ds = sliced_ds.rename({
-        'uo': 'velocity_x',
-        'vo': 'velocity_y'
+    # 4. Keep depth as a singleton dimension (required by dns reader)
+    if "depth" in sliced.dims:
+        sliced = sliced.isel(depth=slice(0, 1))
+    else:
+        sliced = sliced.expand_dims(depth=[0.0])
+
+    # 5. Sort latitude so it increases monotonically
+    sliced = sliced.sortby("latitude")
+
+    # 6. Convert lon/lat to local Cartesian meters
+    R = 6371000.0
+    lon_vals = sliced["longitude"].values
+    lat_vals = sliced["latitude"].values
+
+    lon0 = float(lon_vals[0])
+    lat0 = float(lat_vals[0])
+    mean_lat = float(np.mean(lat_vals))
+
+    x_m = (lon_vals - lon0) * (np.pi / 180.0) * R * np.cos(np.deg2rad(mean_lat))
+    y_m = (lat_vals - lat0) * (np.pi / 180.0) * R
+
+    # 7. Rename velocity variables only
+    compat = sliced.rename({
+        "uo": "velocity_x",
+        "vo": "velocity_y"
     })
-    
-    # Add a dummy velocity_z (required by the dns reader)
-    compat_ds['velocity_z'] = xr.zeros_like(compat_ds['velocity_x'])
 
-    # Ensure the data has a time dimension (even if length 1)
-    if 'time' not in compat_ds.dims:
-        compat_ds = compat_ds.expand_dims('time')
+    # 8. Replace coordinate VALUES, but keep coordinate NAMES
+    compat = compat.assign_coords(
+        longitude=("longitude", x_m.astype(np.float64)),
+        latitude=("latitude", y_m.astype(np.float64))
+    )
 
-    # 5. Save the processed data
-    # Format the filename with coordinates as requested
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    coord_suffix = f"_{int(lat_n)}N{int(lat_s)}S{int(lon_e)}E{int(lon_w)}W"
+    # 9. Optional background-flow subtraction
+    if subtract_mean:
+        compat["velocity_x"] = compat["velocity_x"] - compat["velocity_x"].mean(
+            dim=("latitude", "longitude")
+        )
+        compat["velocity_y"] = compat["velocity_y"] - compat["velocity_y"].mean(
+            dim=("latitude", "longitude")
+        )
+
+    # 10. Add dummy vertical velocity component
+    compat["velocity_z"] = xr.zeros_like(compat["velocity_x"])
+
+    # 11. Keep only what the dns reader needs
+    compat = compat[["velocity_x", "velocity_y", "velocity_z"]]
+
+    # 12. Enforce exact dimension order expected by the dns reader
+    compat = compat.transpose("time", "depth", "latitude", "longitude")
+
+    # 13. Add metadata
+    compat["longitude"].attrs["units"] = "m"
+    compat["latitude"].attrs["units"] = "m"
+    compat["depth"].attrs["units"] = "m"
+    compat["velocity_x"].attrs["units"] = "m s-1"
+    compat["velocity_y"].attrs["units"] = "m s-1"
+    compat["velocity_z"].attrs["units"] = "m s-1"
+
+    # 14. Build output filename (using a default base_name since input_path is gone)
+    base_name = "GPGP_oct2020"
+    coord_suffix = f"_{abs(int(lat_s))}-{abs(int(lat_n))}N_{abs(int(lon_w))}-{abs(int(lon_e))}W"
     output_filename = f"../data/{base_name}{coord_suffix}.nc"
 
-    compat_ds.to_netcdf(output_filename)
-    
+    # 15. Save
+    compat.to_netcdf(output_filename)
+
+    # 16. Diagnostics
+    print(f"Saved to: {output_filename}")
+    print("velocity_x dims :", compat["velocity_x"].dims)
+    print("velocity_x shape:", compat["velocity_x"].shape)
+    print("longitude range :", float(compat["longitude"].values[0]), "to", float(compat["longitude"].values[-1]), "m")
+    print("latitude range  :", float(compat["latitude"].values[0]), "to", float(compat["latitude"].values[-1]), "m")
+
     return output_filename
 
 
