@@ -114,12 +114,12 @@ class VelocityField:
             except IOError:
                 sys.exit("\nReading error. Maybe a wrong file type?\n")
 
-            self.u_velocity_matrix = np.array(datafile_read.variables['velocity_x'][time_step, :, :])
-            self.v_velocity_matrix = np.array(datafile_read.variables['velocity_y'][time_step, :, :])
-            self.w_velocity_matrix = np.array(datafile_read.variables['velocity_z'][time_step, :, :])
-            self.x_coordinate_matrix = np.linspace(0, self.u_velocity_matrix.shape[1], self.u_velocity_matrix.shape[1])
-            self.y_coordinate_matrix = np.linspace(0, self.u_velocity_matrix.shape[0], self.u_velocity_matrix.shape[0])
-            self.z_coordinate_matrix = np.linspace(0, self.u_velocity_matrix.shape[0], self.u_velocity_matrix.shape[0])
+            self.u_velocity_matrix = np.array(datafile_read.variables['velocity_x'][time_step, 0, :, :])
+            self.v_velocity_matrix = np.array(datafile_read.variables['velocity_y'][time_step, 0, :, :])
+            self.w_velocity_matrix = np.array(datafile_read.variables['velocity_z'][time_step, 0, :, :])
+            self.x_coordinate_matrix = np.array(datafile_read.variables['longitude'])
+            self.y_coordinate_matrix = np.array(datafile_read.variables['latitude'])
+            self.z_coordinate_matrix = np.zeros_like(self.x_coordinate_matrix)
             self.x_coordinate_size = self.u_velocity_matrix.shape[1]
             self.y_coordinate_size = self.u_velocity_matrix.shape[0]
             self.z_coordinate_size = 1
@@ -241,12 +241,15 @@ class VelocityField:
 
             # 1. Map GLORYS variables (uo, vo) to the internal matrices
             # Handling potential 4D (time, depth, lat, lon) or 2D slices
-            u = np.array(datafile_read.variables['uo'][:])
-            v = np.array(datafile_read.variables['vo'][:])
+            u = np.array(datafile_read.variables['uo'][time_step, 0, :, :])
+            v = np.array(datafile_read.variables['vo'][time_step, 0, :, :])
             
-            # Squeeze out singular dimensions (like depth or time) if they exist
-            self.u_velocity_matrix = np.squeeze(u)
-            self.v_velocity_matrix = np.squeeze(v)
+            self.u_velocity_matrix = u
+            self.v_velocity_matrix = v
+            
+            # Subtract mean velocity to focus on fluctuations
+            self.u_velocity_matrix = self.u_velocity_matrix - np.mean(self.u_velocity_matrix, axis=1, keepdims=True)
+            self.v_velocity_matrix = self.v_velocity_matrix - np.mean(self.v_velocity_matrix, axis=1, keepdims=True)
             
             # 2. Extract Coordinates (degrees)
             lons = np.array(datafile_read.variables['longitude'][:])
@@ -261,6 +264,10 @@ class VelocityField:
             self.x_coordinate_matrix = (lons - lons[0]) * (np.pi/180.0) * R * np.cos(np.deg2rad(mean_lat))
             # y = lat * rad * R
             self.y_coordinate_matrix = (lats - lats[0]) * (np.pi/180.0) * R
+            
+            # Set coordinate steps for fitting
+            self.x_coordinate_step = np.mean(np.diff(self.x_coordinate_matrix))
+            self.y_coordinate_step = np.mean(np.diff(self.y_coordinate_matrix))
             
             # 4. Optional 3rd component (set to zero for 2D surface data) [cite: 82]
             self.w_velocity_matrix = np.zeros_like(self.u_velocity_matrix)

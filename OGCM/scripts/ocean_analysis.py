@@ -164,38 +164,52 @@ def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=Non
 
 def preprocess_netcdf(input_path, les_box, active=True):
     """
-    Slices a NetCDF file to a target box and saves it with coordinate suffix.
-    les_box format: [lon_min, lon_max, lat_min, lat_max]
+    Slices GLORYS data and transforms it into a format directly compatible 
+    with the 'dns' file_type in VortexFitting.
     """
     if not active:
         print("Vortex box saving is DEACTIVATED.")
         return None
 
     # 1. Load the dataset
-    # VortexFitting supports NetCDF input natively
     ds = xr.open_dataset(input_path)
 
-    # 2. Extract coordinates for naming and slicing
+    # 2. Spatial Slicing
     lon_w, lon_e, lat_s, lat_n = les_box
-    
-    # 3. Perform the spatial slice
-    # This creates the two-dimensional velocity field required 
-    sliced_ds = ds.sel(
-        longitude=slice(lon_w, lon_e),
-        latitude=slice(lat_s, lat_n)
-    )
+    sliced_ds = ds.sel(longitude=slice(lon_w, lon_e), latitude=slice(lat_s, lat_n))
 
-    # 4. Construct the new filename
-    # Format: GPGP_oct2020_XNXSXEXW.nc
+    # 3. Cartesian Coordinate Conversion (Degrees to Meters)
+    # VortexFitting requires a uniform spatial mesh in a Cartesian referential [cite: 81]
+    R = 6371000.0  # Earth's radius in meters
+    mean_lat = sliced_ds.latitude.mean()
+    
+    # Calculate relative x and y in meters
+    x_m = (sliced_ds.longitude - sliced_ds.longitude[0]) * (np.pi/180.0) * R * np.cos(np.deg2rad(mean_lat))
+    y_m = (sliced_ds.latitude - sliced_ds.latitude[0]) * (np.pi/180.0) * R
+
+    # 4. Rename and Reformat for 'dns' Compatibility
+    # The tool expects velocity_x, velocity_y, and velocity_z
+    # It also expects a time dimension for indexing
+    compat_ds = sliced_ds.rename({
+        'uo': 'velocity_x',
+        'vo': 'velocity_y'
+    })
+    
+    # Add a dummy velocity_z (required by the dns reader)
+    compat_ds['velocity_z'] = xr.zeros_like(compat_ds['velocity_x'])
+
+    # Ensure the data has a time dimension (even if length 1)
+    if 'time' not in compat_ds.dims:
+        compat_ds = compat_ds.expand_dims('time')
+
+    # 5. Save the processed data
+    # Format the filename with coordinates as requested
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     coord_suffix = f"_{int(lat_n)}N{int(lat_s)}S{int(lon_e)}E{int(lon_w)}W"
     output_filename = f"../data/{base_name}{coord_suffix}.nc"
 
-    # 5. Save the processed data
-    # Standard NetCDF4 format is recommended for compatibility [cite: 47]
-    sliced_ds.to_netcdf(output_filename)
+    compat_ds.to_netcdf(output_filename)
     
-    print(f"Successfully saved sliced data to: {output_filename}")
     return output_filename
 
 

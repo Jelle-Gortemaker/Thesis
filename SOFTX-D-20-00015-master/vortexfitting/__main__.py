@@ -88,7 +88,9 @@ def main():
                              'piv_netcdf: read a netCDF format\n'
                              'dns: read a netCDF format\n'
                              'piv_tecplot: read a tecplot format\n'
-                             'openfoam: read an openfoam format\n')
+                             'openfoam: read an openfoam format\n'
+                             'glorys: read GLORYS NetCDF format\n')
+
 
     parser.add_argument('-ct', '--corrthreshold', dest='correlation_threshold',
                         default=0.75, type=float,
