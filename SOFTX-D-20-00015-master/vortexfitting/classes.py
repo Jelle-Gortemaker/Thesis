@@ -230,6 +230,51 @@ class VelocityField:
             self.normalization_flag = False
             self.normalization_direction = 'None'
 
+# GLORYS data special handling, as it has a specific structure
+
+        if file_type == 'glorys':
+            # GLORYS data, NetCDF format
+            try:
+                datafile_read = netCDF4.Dataset(self.file_path, 'r')
+            except IOError:
+                sys.exit("\nReading error. Maybe the path is wrong or the file is open elsewhere?\n")
+
+            # 1. Map GLORYS variables (uo, vo) to the internal matrices
+            # Handling potential 4D (time, depth, lat, lon) or 2D slices
+            u = np.array(datafile_read.variables['uo'][:])
+            v = np.array(datafile_read.variables['vo'][:])
+            
+            # Squeeze out singular dimensions (like depth or time) if they exist
+            self.u_velocity_matrix = np.squeeze(u)
+            self.v_velocity_matrix = np.squeeze(v)
+            
+            # 2. Extract Coordinates (degrees)
+            lons = np.array(datafile_read.variables['longitude'][:])
+            lats = np.array(datafile_read.variables['latitude'][:])
+
+            # 3. Convert degrees to a local Cartesian grid (meters) 
+            # R_earth = 6371000m. Standard conversion for a local box.
+            R = 6371000.0
+            mean_lat = np.mean(lats)
+            
+            # x = lon * rad * R * cos(lat)
+            self.x_coordinate_matrix = (lons - lons[0]) * (np.pi/180.0) * R * np.cos(np.deg2rad(mean_lat))
+            # y = lat * rad * R
+            self.y_coordinate_matrix = (lats - lats[0]) * (np.pi/180.0) * R
+            
+            # 4. Optional 3rd component (set to zero for 2D surface data) [cite: 82]
+            self.w_velocity_matrix = np.zeros_like(self.u_velocity_matrix)
+            self.z_coordinate_matrix = 0.0
+
+            # 5. Define Metadata for detection.py and fitting.py [cite: 167, 168]
+            self.x_coordinate_size = self.u_velocity_matrix.shape[1]
+            self.y_coordinate_size = self.u_velocity_matrix.shape[0]
+            self.z_coordinate_size = 1
+            self.normalization_flag = False  # Set True if you want to use Eq. 10 [cite: 131]
+            self.normalization_direction = 'None'
+
+            datafile_read.close()
+
         if file_type == 'openfoam':
             try:
                 datafile_read = np.loadtxt(self.file_path, delimiter=" ", dtype=float,

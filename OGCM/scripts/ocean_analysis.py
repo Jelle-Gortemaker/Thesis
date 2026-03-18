@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import os
+import sys
 
 def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0):
     """Loads, averages, and extracts the surface layer from GLORYS data."""
@@ -159,6 +161,42 @@ def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=Non
         robust=True,
         vector_scale=15
     )
+
+def preprocess_netcdf(input_path, les_box, active=True):
+    """
+    Slices a NetCDF file to a target box and saves it with coordinate suffix.
+    les_box format: [lon_min, lon_max, lat_min, lat_max]
+    """
+    if not active:
+        print("Vortex box saving is DEACTIVATED.")
+        return None
+
+    # 1. Load the dataset
+    # VortexFitting supports NetCDF input natively
+    ds = xr.open_dataset(input_path)
+
+    # 2. Extract coordinates for naming and slicing
+    lon_w, lon_e, lat_s, lat_n = les_box
+    
+    # 3. Perform the spatial slice
+    # This creates the two-dimensional velocity field required 
+    sliced_ds = ds.sel(
+        longitude=slice(lon_w, lon_e),
+        latitude=slice(lat_s, lat_n)
+    )
+
+    # 4. Construct the new filename
+    # Format: GPGP_oct2020_XNXSXEXW.nc
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    coord_suffix = f"_{int(lat_n)}N{int(lat_s)}S{int(lon_e)}E{int(lon_w)}W"
+    output_filename = f"../data/{base_name}{coord_suffix}.nc"
+
+    # 5. Save the processed data
+    # Standard NetCDF4 format is recommended for compatibility [cite: 47]
+    sliced_ds.to_netcdf(output_filename)
+    
+    print(f"Successfully saved sliced data to: {output_filename}")
+    return output_filename
 
 
 def calculate_EDS(filepath, target_box, max_wavelength_km=800.0):
