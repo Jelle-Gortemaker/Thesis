@@ -452,80 +452,44 @@ def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean
 #     ).dropna(dim="characteristic_length")
 
 
+
 def calculate_EDS(
     filepath,
     target_box=None,
-    max_wavelength_km=400.0,
+    max_wavelength_km=None,
     initialized_velocity=False,
     x_res=None,
     y_res=None,
     n_bins=40,
     remove_mean=True,
-    apply_hann_window=True,
+    window="tukey",  # None, "hann", "tukey"
+    tukey_alpha=0.2,
     direction_half_width_deg=15.0,
 ):
     """
-    Calculate an isotropic horizontal kinetic-energy spectrum from 2D velocity fields,
-    plus a simple isotropy check based on zonal vs meridional directional spectra.
+    Calculate horizontal KE spectra from 2D velocity fields.
 
-    Method
-    ------
-    1. Compute FFT of u and v separately
-    2. Form 2D horizontal kinetic-energy spectrum
-    3. Radially bin in |k| to get isotropic E(k)
-    4. Compute directional spectra near zonal and meridional axes
-    5. Average over time snapshots
+    Returns both:
+    - shell_integrated_spectrum: total KE in each radial wavenumber bin
+    - spectral_density: shell-integrated spectrum divided by bin width dk,
+      which is much more appropriate for slope comparisons in k-space
+
+    Also returns:
+    - zonal_spectrum_density
+    - meridional_spectrum_density
+    - isotropy_ratio = zonal / meridional
 
     Notes
     -----
-    - The returned isotropic spectrum is formed from the velocity field itself,
-      not from a precomputed scalar KE field.
-    - A Hann window is applied by default to reduce spectral leakage.
-    - The isotropy check is intentionally simple:
-          R(k) = E_zonal(k) / E_meridional(k)
-      If R(k) ~ 1 over a range of scales, isotropic averaging is more defensible there.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to NetCDF file.
-    target_box : list or None
-        If initialized_velocity=False:
-            [lon_min, lon_max, lat_min, lat_max]
-        If initialized_velocity=True:
-            [x_min, x_max, y_min, y_max] in meters
-        If None, full horizontal domain is used.
-    max_wavelength_km : float
-        Largest wavelength to include in binning.
-    initialized_velocity : bool
-        True for initialized MITgcm-style Cartesian x/y grids.
-        False for lon/lat datasets.
-    x_res, y_res : float or None
-        Horizontal grid spacing in meters for initialized_velocity=True.
-        If None, inferred from x and y coordinates.
-    n_bins : int
-        Number of logarithmic radial wavenumber bins.
-    remove_mean : bool
-        If True, subtract spatial mean from u and v before FFT.
-    apply_hann_window : bool
-        If True, apply a separable 2D Hann window before FFT.
-    direction_half_width_deg : float
-        Half-width of angular sectors used for zonal/meridional spectra.
-
-    Returns
-    -------
-    xr.Dataset
-        Dataset containing:
-        - energy_density_spectrum(characteristic_length): isotropic shell-integrated KE spectrum
-        - zonal_spectrum(characteristic_length): directional spectrum around kx-axis
-        - meridional_spectrum(characteristic_length): directional spectrum around ky-axis
-        - isotropy_ratio(characteristic_length): zonal / meridional
+    - Wavenumbers are in cycles per meter.
+    - characteristic_length = 1 / k_center
+    - For checking -5/3 or -3 slopes, use `spectral_density` and plot against `wavenumber`.
     """
 
     ds = xr.open_dataset(filepath)
 
     # ------------------------------------------------------------------
-    # 1. Select horizontal box and infer grid spacing
+    # 1. Select horizontal box and infer spacing
     # ------------------------------------------------------------------
     if initialized_velocity:
         if target_box is None:
@@ -571,52 +535,81 @@ def calculate_EDS(
         nx = len(box_ds.longitude)
 
     # ------------------------------------------------------------------
-    # 2. Build wavenumber grid
-    #    Units: cycles per meter, consistent with np.fft.fftfreq
+    # 2. Wavenumber grid
     # ------------------------------------------------------------------
     kx = np.fft.fftfreq(nx, d=dx)
     ky = np.fft.fftfreq(ny, d=dy)
     kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="xy")
 
     k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
-    theta = np.rad2deg(np.arctan2(ky_grid, kx_grid))  # angle in degrees, [-180, 180]
+    theta = np.rad2deg(np.arctan2(ky_grid, kx_grid))
 
     valid_k = k_mag > 0
     if not np.any(valid_k):
         raise ValueError("No valid nonzero wavenumbers found.")
 
-    k_min = 1.0 / (max_wavelength_km * 1000.0)
+    # Natural largest resolvable wavelength from box size
+    Lx = nx * dx
+    Ly = ny * dy
+    natural_lambda_max = min(Lx, Ly)
+
+    if max_wavelength_km is None:
+        lambda_max = natural_lambda_max
+    else:
+        lambda_max = min(max_wavelength_km * 1000.0, natural_lambda_max)
+
+    k_min = 1.0 / lambda_max
     k_max = np.nanmax(k_mag[valid_k])
 
     if k_min >= k_max:
         raise ValueError(
-            "max_wavelength_km is too small for the selected domain/grid. "
-            "Choose a larger max_wavelength_km or a larger spatial box."
+            "Selected max wavelength is too small relative to the domain/grid."
         )
 
     k_bins = np.logspace(np.log10(k_min), np.log10(k_max), num=n_bins + 1)
     k_centers = np.sqrt(k_bins[:-1] * k_bins[1:])
+    dk = np.diff(k_bins)
 
     # ------------------------------------------------------------------
-    # 3. Optional 2D Hann window
+    # 3. Window
     # ------------------------------------------------------------------
-    if apply_hann_window:
+    def tukey_window(n, alpha=0.2):
+        if alpha <= 0:
+            return np.ones(n)
+        if alpha >= 1:
+            return np.hanning(n)
+
+        w = np.ones(n)
+        x = np.linspace(0, 1, n)
+
+        first = x < alpha / 2
+        last = x > 1 - alpha / 2
+
+        w[first] = 0.5 * (1 + np.cos(2 * np.pi / alpha * (x[first] - alpha / 2)))
+        w[last] = 0.5 * (1 + np.cos(2 * np.pi / alpha * (x[last] - 1 + alpha / 2)))
+        return w
+
+    if window is None:
+        window_2d = np.ones((ny, nx), dtype=float)
+    elif window == "hann":
         wx = np.hanning(nx)
         wy = np.hanning(ny)
         window_2d = np.outer(wy, wx)
-
-        # Normalize so mean(window^2) = 1, keeping spectral levels comparable
-        window_norm = np.sqrt(np.mean(window_2d**2))
-        if window_norm == 0:
-            raise ValueError("Invalid window normalization.")
-        window_2d = window_2d / window_norm
+    elif window == "tukey":
+        wx = tukey_window(nx, alpha=tukey_alpha)
+        wy = tukey_window(ny, alpha=tukey_alpha)
+        window_2d = np.outer(wy, wx)
     else:
-        window_2d = np.ones((ny, nx), dtype=float)
+        raise ValueError("window must be None, 'hann', or 'tukey'")
+
+    # Normalize window so mean(window^2)=1
+    window_norm = np.sqrt(np.mean(window_2d**2))
+    if window_norm == 0:
+        raise ValueError("Invalid window normalization.")
+    window_2d = window_2d / window_norm
 
     # ------------------------------------------------------------------
-    # 4. Direction masks for simple isotropy check
-    #    Zonal: around 0° and 180°
-    #    Meridional: around 90° and -90°
+    # 4. Direction masks
     # ------------------------------------------------------------------
     hw = float(direction_half_width_deg)
 
@@ -627,12 +620,13 @@ def calculate_EDS(
     zonal_mask = angle_close(theta, 0.0, hw) | angle_close(theta, 180.0, hw)
     meridional_mask = angle_close(theta, 90.0, hw) | angle_close(theta, -90.0, hw)
 
-    all_iso_spectra = []
-    all_zonal_spectra = []
-    all_merid_spectra = []
+    all_shell = []
+    all_density = []
+    all_zonal_density = []
+    all_merid_density = []
 
     # ------------------------------------------------------------------
-    # 5. Loop over time
+    # 5. Time loop
     # ------------------------------------------------------------------
     n_time = len(box_ds.time)
 
@@ -640,7 +634,7 @@ def calculate_EDS(
         u = box_ds.uo.isel(time=t).values
         v = box_ds.vo.isel(time=t).values
 
-        # Replace NaNs first to avoid mean/window issues
+        # Mask handling
         u = np.nan_to_num(u, nan=0.0)
         v = np.nan_to_num(v, nan=0.0)
 
@@ -648,48 +642,49 @@ def calculate_EDS(
             u = u - np.mean(u)
             v = v - np.mean(v)
 
-        # Apply window
         u = u * window_2d
         v = v * window_2d
 
-        # FFTs
         u_hat = np.fft.fft2(u)
         v_hat = np.fft.fft2(v)
 
-        # 2D horizontal KE spectrum
-        # Shell-integrated form for relative spectral energy comparisons
+        # 2D KE-like spectral field
         ke_2d = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (nx * ny)
 
-        E_iso = np.full(n_bins, np.nan)
-        E_zonal = np.full(n_bins, np.nan)
-        E_merid = np.full(n_bins, np.nan)
+        shell_spectrum = np.full(n_bins, np.nan)
+        density_spectrum = np.full(n_bins, np.nan)
+        zonal_density = np.full(n_bins, np.nan)
+        merid_density = np.full(n_bins, np.nan)
 
         for i in range(n_bins):
             shell = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
 
-            shell_iso = shell
             shell_zonal = shell & zonal_mask
             shell_merid = shell & meridional_mask
 
-            if np.any(shell_iso):
-                E_iso[i] = np.nansum(ke_2d[shell_iso])
+            if np.any(shell):
+                shell_sum = np.nansum(ke_2d[shell])
+                shell_spectrum[i] = shell_sum
+                density_spectrum[i] = shell_sum / dk[i]
 
             if np.any(shell_zonal):
-                E_zonal[i] = np.nansum(ke_2d[shell_zonal])
+                zonal_density[i] = np.nansum(ke_2d[shell_zonal]) / dk[i]
 
             if np.any(shell_merid):
-                E_merid[i] = np.nansum(ke_2d[shell_merid])
+                merid_density[i] = np.nansum(ke_2d[shell_merid]) / dk[i]
 
-        all_iso_spectra.append(E_iso)
-        all_zonal_spectra.append(E_zonal)
-        all_merid_spectra.append(E_merid)
+        all_shell.append(shell_spectrum)
+        all_density.append(density_spectrum)
+        all_zonal_density.append(zonal_density)
+        all_merid_density.append(merid_density)
 
-    mean_iso = np.nanmean(np.asarray(all_iso_spectra), axis=0)
-    mean_zonal = np.nanmean(np.asarray(all_zonal_spectra), axis=0)
-    mean_merid = np.nanmean(np.asarray(all_merid_spectra), axis=0)
+    mean_shell = np.nanmean(np.asarray(all_shell), axis=0)
+    mean_density = np.nanmean(np.asarray(all_density), axis=0)
+    mean_zonal_density = np.nanmean(np.asarray(all_zonal_density), axis=0)
+    mean_merid_density = np.nanmean(np.asarray(all_merid_density), axis=0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        isotropy_ratio = mean_zonal / mean_merid
+        isotropy_ratio = mean_zonal_density / mean_merid_density
 
     # ------------------------------------------------------------------
     # 6. Nyquist cutoff
@@ -697,44 +692,49 @@ def calculate_EDS(
     f_nyquist = 1.0 / (2.0 * max(dx, dy))
     nyq_mask = k_centers <= f_nyquist
 
-    characteristic_length = 1.0 / k_centers[nyq_mask]
-
     out = xr.Dataset(
         data_vars={
-            "energy_density_spectrum": (
-                ("characteristic_length",),
-                mean_iso[nyq_mask],
+            "shell_integrated_spectrum": (
+                ("wavenumber",),
+                mean_shell[nyq_mask],
             ),
-            "zonal_spectrum": (
-                ("characteristic_length",),
-                mean_zonal[nyq_mask],
+            "spectral_density": (
+                ("wavenumber",),
+                mean_density[nyq_mask],
             ),
-            "meridional_spectrum": (
-                ("characteristic_length",),
-                mean_merid[nyq_mask],
+            "zonal_spectrum_density": (
+                ("wavenumber",),
+                mean_zonal_density[nyq_mask],
+            ),
+            "meridional_spectrum_density": (
+                ("wavenumber",),
+                mean_merid_density[nyq_mask],
             ),
             "isotropy_ratio": (
-                ("characteristic_length",),
+                ("wavenumber",),
                 isotropy_ratio[nyq_mask],
             ),
         },
         coords={
-            "characteristic_length": characteristic_length,
+            "wavenumber": k_centers[nyq_mask],
+            "characteristic_length": ("wavenumber", 1.0 / k_centers[nyq_mask]),
         },
         attrs={
-            "method": "velocity_fft_to_2d_ke_then_shell_binning",
-            "initialized_velocity": initialized_velocity,
             "dx_m": dx,
             "dy_m": dy,
+            "domain_Lx_km": Lx / 1000.0,
+            "domain_Ly_km": Ly / 1000.0,
+            "natural_lambda_max_km": natural_lambda_max / 1000.0,
+            "used_lambda_max_km": lambda_max / 1000.0,
             "nyquist_km": (1.0 / f_nyquist) / 1000.0,
-            "window": "hann" if apply_hann_window else "none",
-            "direction_half_width_deg": direction_half_width_deg,
+            "window": "none" if window is None else window,
+            "tukey_alpha": tukey_alpha if window == "tukey" else np.nan,
             "notes": (
-                "energy_density_spectrum is the isotropic shell-integrated horizontal KE spectrum. "
-                "isotropy_ratio = zonal_spectrum / meridional_spectrum; values near 1 suggest "
-                "approximate isotropy over that scale range."
+                "shell_integrated_spectrum = total KE per radial shell; "
+                "spectral_density = shell_integrated_spectrum / dk, "
+                "recommended for slope comparisons in k-space."
             ),
         },
     )
 
-    return out.dropna(dim="characteristic_length", how="all")
+    return out.dropna(dim="wavenumber", how="all")
