@@ -43,62 +43,79 @@ def get_subdomain(lat_min, lon_min, lat_max, lon_max):
     return [lon_min, lon_max, lat_min, lat_max]
 
 
-def calculate_coriolis_beta_plane(ds_slice):
-    """
-    Calculates the Coriolis parameter f using the beta-plane approximation.
-    f = f0 + beta * y
-    """
-    omega_earth = 7.2921e-5  # Earth's angular velocity [rad/s]
-    R = 6371000             # Earth's radius [m]
+# def calculate_coriolis_beta_plane(ds_slice):
+#     """
+#     Calculates the Coriolis parameter f using the beta-plane approximation.
+#     f = f0 + beta * y
+#     """
+#     omega_earth = 7.2921e-5  # Earth's angular velocity [rad/s]
+#     R = 6371000             # Earth's radius [m]
     
-    # Identify lat dimension name
-    lat_dim = 'latitude' if 'latitude' in ds_slice.dims else 'lat'
+#     # Identify lat dimension name
+#     lat_dim = 'latitude' if 'latitude' in ds_slice.dims else 'lat'
     
-    # 1. Define reference latitude (center of the domain)
-    phi_0_deg = float(ds_slice[lat_dim].mean())
-    phi_0_rad = np.deg2rad(phi_0_deg)
+#     # 1. Define reference latitude (center of the domain)
+#     phi_0_deg = float(ds_slice[lat_dim].mean())
+#     phi_0_rad = np.deg2rad(phi_0_deg)
     
-    # 2. Calculate constants
-    f0 = 2 * omega_earth * np.sin(phi_0_rad)
-    beta = (2 * omega_earth * np.cos(phi_0_rad)) / R
+#     # 2. Calculate constants
+#     f0 = 2 * omega_earth * np.sin(phi_0_rad)
+#     beta = (2 * omega_earth * np.cos(phi_0_rad)) / R
     
-    # 3. Calculate y (meridional distance from the center in meters)
-    y = (ds_slice[lat_dim] - phi_0_deg) * (np.pi * R / 180)
+#     # 3. Calculate y (meridional distance from the center in meters)
+#     y = (ds_slice[lat_dim] - phi_0_deg) * (np.pi * R / 180)
     
-    f = f0 + beta * y
-    return f.assign_attrs(units='s^-1', long_name='Coriolis parameter (beta-plane)')
+#     f = f0 + beta * y
+#     return f.assign_attrs(units='s^-1', long_name='Coriolis parameter (beta-plane)')
+
+# def get_eddy_intensity(results, alpha=0.2):
+#     """
+#     Returns the vorticity field only where OW passes the threshold.
+#     This allows us to see:
+#     1. Strength (magnitude of vorticity)
+#     2. Rotation sign (Cyclonic > 0, Anticyclonic < 0 in NH)
+#     """
+#     ow_param = results.w
+#     vorticity = results.vorticity
+    
+#     # Identify dims for standard deviation
+#     dims_to_std = [d for d in ['latitude', 'longitude', 'lat', 'lon'] if d in ow_param.coords]
+    
+#     sigma_W = ow_param.std(dim=dims_to_std)
+#     ow_threshold = -alpha * sigma_W
+    
+#     # Create the binary mask
+#     mask = xr.where(ow_param < ow_threshold, 1, 0)
+    
+#     # Proxy for Intensity: Relative Vorticity masked by OW
+#     # Positive values = Cyclonic, Negative = Anticyclonic (Northern Hemisphere)
+#     signed_intensity = vorticity.where(mask == 1)
+    
+#     # Optional: Normalize by Coriolis to get Rossby Number cores
+#     ro_intensity = (vorticity / results.f).where(mask == 1)
+    
+#     return signed_intensity, ro_intensity, mask
 
 def get_eddy_intensity(results, alpha=0.2):
     """
-    Returns the vorticity field only where OW passes the threshold.
-    This allows us to see:
-    1. Strength (magnitude of vorticity)
-    2. Rotation sign (Cyclonic > 0, Anticyclonic < 0 in NH)
+    Returns vorticity only where OW passes the threshold.
     """
     ow_param = results.w
     vorticity = results.vorticity
-    
-    # Identify dims for standard deviation
+
     dims_to_std = [d for d in ['latitude', 'longitude', 'lat', 'lon'] if d in ow_param.coords]
-    
+
     sigma_W = ow_param.std(dim=dims_to_std)
     ow_threshold = -alpha * sigma_W
-    
-    # Create the binary mask
+
     mask = xr.where(ow_param < ow_threshold, 1, 0)
-    
-    # Proxy for Intensity: Relative Vorticity masked by OW
-    # Positive values = Cyclonic, Negative = Anticyclonic (Northern Hemisphere)
     signed_intensity = vorticity.where(mask == 1)
-    
-    # Optional: Normalize by Coriolis to get Rossby Number cores
-    ro_intensity = (vorticity / results.f).where(mask == 1)
-    
-    return signed_intensity, ro_intensity, mask
+
+    return signed_intensity, mask
 
 def calculate_okubo_weiss(ds_slice):
-    """Calculates OW parameter with broadcasting fix for latitude-dependent dx."""
-    R = 6371000 
+    """Calculates Okubo-Weiss parameter and relative vorticity."""
+    R = 6371000
     lon_dim = 'longitude' if 'longitude' in ds_slice.dims else 'lon'
     lat_dim = 'latitude' if 'latitude' in ds_slice.dims else 'lat'
 
@@ -110,7 +127,7 @@ def calculate_okubo_weiss(ds_slice):
 
     grad_u = np.gradient(ds_slice.uo.values)
     grad_v = np.gradient(ds_slice.vo.values)
-    
+
     du_di, du_dj = grad_u[0], grad_u[1]
     dv_di, dv_dj = grad_v[0], grad_v[1]
 
@@ -119,14 +136,14 @@ def calculate_okubo_weiss(ds_slice):
     du_dy = du_di / dy
     dv_dy = dv_di / dy
 
-    sn, ss, omega = (du_dx - dv_dy), (dv_dx + du_dy), (dv_dx - du_dy)
+    sn = du_dx - dv_dy
+    ss = dv_dx + du_dy
+    omega = dv_dx - du_dy
     w = sn**2 + ss**2 - omega**2
-    f = calculate_coriolis_beta_plane(ds_slice)
-    
+
     return xr.Dataset({
         'w': ((lat_dim, lon_dim), w),
         'vorticity': ((lat_dim, lon_dim), omega),
-        'f': ((lat_dim), f.values)
     }, coords=ds_slice.coords)
 
 def plot_ocean_field(data, u=None, v=None, title="", cmap='viridis', label="", target_box=None, **kwargs):
