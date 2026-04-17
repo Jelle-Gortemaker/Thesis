@@ -1,21 +1,30 @@
 # VS Code
 .vscode/
 
-# Python
+# Python & Jupyter
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .ipynb_checkpoints/
+.venv/
 
-# Local data
-data/raw/
-data/processed/
+# Local data (matches any folder named data/raw, data/input, etc.)
+**/data/
+
+# Large Binary formats
 *.nc
 *.tif
 *.tiff
+*.bin
+*.meta
+*.data
+
+# MITgcm specific
+mnc_*/
 
 # Secrets / local configs
 .env
-*.json
+# *.json  <-- Uncomment this only if you are SURE you don't need any json files synced
 
 # OS
 .DS_Store
