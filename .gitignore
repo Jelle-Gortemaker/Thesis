@@ -29,3 +29,6 @@ mnc_*/
 # OS
 .DS_Store
 Thumbs.db
+
+# Ignore the SOFTX folder and all its generated files
+SOFTX-D-20-00015-master/
