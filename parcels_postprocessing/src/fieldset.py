@@ -33,23 +33,13 @@ def _pick_first_existing(candidates: list[str], available: list[str]) -> Optiona
 def _detect_coord_names(ds: xr.Dataset) -> tuple[str, str, Optional[str], Optional[str]]:
     names = list(ds.coords) + list(ds.dims)
 
-    x_name = _pick_first_existing(
-        ["X", "XC", "x", "lon", "LON", "Xp1", "XG"], names
-    )
-    y_name = _pick_first_existing(
-        ["Y", "YC", "y", "lat", "LAT", "Yp1", "YG"], names
-    )
-    time_name = _pick_first_existing(
-        ["T", "time", "TIME", "iter"], names
-    )
-    depth_name = _pick_first_existing(
-        ["Z", "depth", "DEPTH", "Zl", "Zu", "Zmd000059", "Zld000059"], names
-    )
+    x_name = _pick_first_existing(["X", "XC", "x", "lon", "Xp1", "XG"], names)
+    y_name = _pick_first_existing(["Y", "YC", "y", "lat", "Yp1", "YG"], names)
+    time_name = _pick_first_existing(["T", "time", "TIME", "iter"], names)
+    depth_name = _pick_first_existing(["Z", "depth", "DEPTH", "Zl", "Zu"], names)
 
     if x_name is None or y_name is None:
-        raise ValueError(
-            f"Could not detect X/Y coordinates. Available coords/dims: {names}"
-        )
+        raise ValueError(f"Could not detect X/Y coordinates. Available: {names}")
 
     return x_name, y_name, time_name, depth_name
 
@@ -57,17 +47,11 @@ def _detect_coord_names(ds: xr.Dataset) -> tuple[str, str, Optional[str], Option
 def _detect_velocity_names(ds: xr.Dataset) -> tuple[str, str]:
     data_vars = list(ds.data_vars)
 
-    u_name = _pick_first_existing(
-        ["U", "UVEL", "uo", "u"], data_vars
-    )
-    v_name = _pick_first_existing(
-        ["V", "VVEL", "vo", "v"], data_vars
-    )
+    u_name = _pick_first_existing(["U", "UVEL", "uo", "u"], data_vars)
+    v_name = _pick_first_existing(["V", "VVEL", "vo", "v"], data_vars)
 
     if u_name is None or v_name is None:
-        raise ValueError(
-            f"Could not detect U/V variables. Available data_vars: {data_vars}"
-        )
+        raise ValueError(f"Could not detect U/V variables. Available: {data_vars}")
 
     return u_name, v_name
 
@@ -83,9 +67,7 @@ def inspect_mitgcm_nc(path: str | Path) -> FieldMeta:
     is_3d = depth_name is not None and depth_name in u_dims
 
     if time_name is None:
-        raise ValueError(
-            f"Could not detect time coordinate in dataset. Available coords/dims: {list(ds.coords) + list(ds.dims)}"
-        )
+        raise ValueError("Could not detect time coordinate.")
 
     return FieldMeta(
         path=path,
@@ -100,10 +82,7 @@ def inspect_mitgcm_nc(path: str | Path) -> FieldMeta:
     )
 
 
-def _rename_to_parcels_convention(
-    ds: xr.Dataset,
-    meta: FieldMeta,
-) -> xr.Dataset:
+def _rename_to_parcels_convention(ds: xr.Dataset, meta: FieldMeta) -> xr.Dataset:
     rename_map = {
         meta.x_name: "x",
         meta.y_name: "y",
@@ -112,8 +91,7 @@ def _rename_to_parcels_convention(
     if meta.depth_name is not None:
         rename_map[meta.depth_name] = "depth"
 
-    ds2 = ds.rename({k: v for k, v in rename_map.items() if k in ds.dims or k in ds.coords})
-    return ds2
+    return ds.rename({k: v for k, v in rename_map.items() if k in ds.coords or k in ds.dims})
 
 
 def _extract_surface_if_needed(ds: xr.Dataset, meta: FieldMeta, surface_only: bool) -> tuple[xr.Dataset, bool]:
@@ -126,14 +104,22 @@ def _extract_surface_if_needed(ds: xr.Dataset, meta: FieldMeta, surface_only: bo
     depth_name = meta.depth_name
     assert depth_name is not None
 
-    # choose shallowest level based on absolute value closest to zero
     depth_values = np.asarray(ds[depth_name].values)
-    if depth_values.ndim != 1:
-        raise ValueError(f"Depth coordinate {depth_name} is not 1D, which this workflow currently expects.")
-
     idx = int(np.argmin(np.abs(depth_values)))
     ds2 = ds.isel({depth_name: idx})
     return ds2, False
+
+
+def _ensure_parcels_coords(ds: xr.Dataset) -> xr.Dataset:
+    coord_map = {}
+    for cname in ["x", "y", "time", "depth"]:
+        if cname in ds.coords:
+            coord_map[cname] = ds.coords[cname]
+        elif cname in ds.variables:
+            coord_map[cname] = ds[cname]
+    if coord_map:
+        ds = ds.assign_coords(coord_map)
+    return ds
 
 
 def build_fieldset(
@@ -142,32 +128,20 @@ def build_fieldset(
     mesh: str = "flat",
     chunks: Optional[dict] = None,
 ) -> tuple[FieldSet, FieldMeta, xr.Dataset]:
-    """
-    Build a Parcels FieldSet from a MITgcm NetCDF file.
-
-    Supports:
-    - 2D U/V fields with dims like (time, y, x)
-    - 3D U/V fields with dims like (time, depth, y, x)
-
-    Assumptions:
-    - file is already on a common grid for U and V
-    - if raw staggered MITgcm fields are used, preprocess first
-    """
     path = Path(path)
     ds = xr.open_dataset(path, chunks=chunks)
     meta = inspect_mitgcm_nc(path)
 
     ds_work, keep_depth = _extract_surface_if_needed(ds, meta, surface_only=surface_only)
     ds_work = _rename_to_parcels_convention(ds_work, meta)
+    ds_work = _ensure_parcels_coords(ds_work)
 
     variables = {"U": meta.u_name, "V": meta.v_name}
 
     if keep_depth:
-        dimensions = {"U": {"lon": "x", "lat": "y", "time": "time", "depth": "depth"},
-                      "V": {"lon": "x", "lat": "y", "time": "time", "depth": "depth"}}
+        dimensions = {"lon": "x", "lat": "y", "time": "time", "depth": "depth"}
     else:
-        dimensions = {"U": {"lon": "x", "lat": "y", "time": "time"},
-                      "V": {"lon": "x", "lat": "y", "time": "time"}}
+        dimensions = {"lon": "x", "lat": "y", "time": "time"}
 
     fieldset = FieldSet.from_xarray_dataset(
         ds_work,
@@ -183,7 +157,7 @@ def summarize_dataset(path: str | Path) -> dict:
     meta = inspect_mitgcm_nc(path)
     ds = xr.open_dataset(path)
 
-    summary = {
+    return {
         "path": str(path),
         "dims": dict(ds.sizes),
         "coords": list(ds.coords),
@@ -196,4 +170,37 @@ def summarize_dataset(path: str | Path) -> dict:
         "v_name": meta.v_name,
         "is_3d": meta.is_3d,
     }
-    return summary
+
+
+def quick_qc_parcels_input(ds: xr.Dataset, u_name: str, v_name: str) -> dict:
+    qc = {}
+
+    qc["dims"] = dict(ds.sizes)
+    qc["coords"] = list(ds.coords)
+    qc["u_dims"] = ds[u_name].dims
+    qc["v_dims"] = ds[v_name].dims
+    qc["u_shape"] = tuple(ds[u_name].shape)
+    qc["v_shape"] = tuple(ds[v_name].shape)
+
+    for cname in ["x", "y", "time"]:
+        qc[f"has_{cname}"] = cname in ds.coords
+
+    qc["has_depth"] = "depth" in ds.coords
+
+    qc["x_min"] = float(ds["x"].min()) if "x" in ds.coords else None
+    qc["x_max"] = float(ds["x"].max()) if "x" in ds.coords else None
+    qc["y_min"] = float(ds["y"].min()) if "y" in ds.coords else None
+    qc["y_max"] = float(ds["y"].max()) if "y" in ds.coords else None
+
+    if "time" in ds.coords:
+        qc["n_time"] = int(ds.sizes["time"])
+        qc["time0"] = str(ds["time"].values[0])
+        qc["time_last"] = str(ds["time"].values[-1])
+
+    if "depth" in ds.coords:
+        qc["depth_values_head"] = np.asarray(ds["depth"].values[:5]).tolist()
+
+    qc["u_nan_fraction_t0"] = float(np.isnan(ds[u_name].isel(time=0)).mean())
+    qc["v_nan_fraction_t0"] = float(np.isnan(ds[v_name].isel(time=0)).mean())
+
+    return qc

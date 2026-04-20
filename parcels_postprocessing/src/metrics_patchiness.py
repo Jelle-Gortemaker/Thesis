@@ -7,9 +7,7 @@ import xarray as xr
 def _get_xy(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
     x_name = "lon" if "lon" in ds.variables else "x"
     y_name = "lat" if "lat" in ds.variables else "y"
-    x = np.asarray(ds[x_name].values)
-    y = np.asarray(ds[y_name].values)
-    return x, y
+    return np.asarray(ds[x_name].values), np.asarray(ds[y_name].values)
 
 
 def density_map_metrics(
@@ -19,7 +17,7 @@ def density_map_metrics(
     hotspot_percentile: float = 95.0,
 ) -> tuple[xr.Dataset, xr.DataArray]:
     x, y = _get_xy(ds)
-    n_particles, n_times = x.shape
+    _, n_times = x.shape
 
     xmin = np.nanmin(x)
     xmax = np.nanmax(x)
@@ -32,7 +30,6 @@ def density_map_metrics(
     H_all = np.zeros((n_times, ny_bins, nx_bins), dtype=float)
     patchiness = np.full(n_times, np.nan)
     hotspot_fraction = np.full(n_times, np.nan)
-    hotspot_threshold = np.full(n_times, np.nan)
 
     for t in range(n_times):
         xt = x[:, t]
@@ -50,16 +47,12 @@ def density_map_metrics(
         positive = H[H > 0]
         if positive.size > 0:
             thr = np.percentile(positive, hotspot_percentile)
-            hotspot_threshold[t] = thr
             hotspot_fraction[t] = np.mean(H >= thr)
 
-    metrics = xr.Dataset(
-        data_vars={
-            "patchiness_index": (("obs",), patchiness),
-            "hotspot_fraction": (("obs",), hotspot_fraction),
-            "hotspot_threshold": (("obs",), hotspot_threshold),
-        }
-    )
+    metrics = xr.Dataset({
+        "patchiness_index": (("obs",), patchiness),
+        "hotspot_fraction": (("obs",), hotspot_fraction),
+    })
 
     density_maps = xr.DataArray(
         H_all,

@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import numpy as np
+import xarray as xr
 from parcels import ParticleSet, AdvectionRK4
 
 from .fieldset import build_fieldset
 from .particles import SurfaceParticle, DepthParticle
 from .kernels import age_particle
-from .io_utils import ensure_dir
+from .io_utils import ensure_dir, open_trajectory_dataset
 
 
 @dataclass
@@ -49,13 +50,7 @@ def _make_release_points_random(xmin, xmax, ymin, ymax, n_particles, seed):
     return x, y
 
 
-def run_parcels_experiment(config: RunConfig) -> dict:
-    fieldset, meta, ds = build_fieldset(
-        config.input_nc,
-        surface_only=config.surface_only,
-        mesh=config.mesh,
-    )
-
+def prepare_release(config: RunConfig, ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
     x = ds["x"].values
     y = ds["y"].values
 
@@ -65,39 +60,32 @@ def run_parcels_experiment(config: RunConfig) -> dict:
     ymax = float(np.max(y)) if config.ymax is None else float(config.ymax)
 
     if config.release_mode == "grid":
-        lon0, lat0 = _make_release_points_grid(xmin, xmax, ymin, ymax, config.nx, config.ny)
+        return _make_release_points_grid(xmin, xmax, ymin, ymax, config.nx, config.ny)
     elif config.release_mode == "random":
-        lon0, lat0 = _make_release_points_random(
-            xmin, xmax, ymin, ymax, config.n_particles, config.seed
-        )
+        return _make_release_points_random(xmin, xmax, ymin, ymax, config.n_particles, config.seed)
     else:
         raise ValueError(f"Unknown release_mode: {config.release_mode}")
+
+
+def run_parcels_experiment(config: RunConfig) -> dict:
+    fieldset, meta, ds = build_fieldset(
+        config.input_nc,
+        surface_only=config.surface_only,
+        mesh=config.mesh,
+    )
+
+    lon0, lat0 = prepare_release(config, ds)
 
     output_path = Path(config.output_path)
     ensure_dir(output_path.parent)
 
     if meta.is_3d and not config.surface_only:
         pclass = DepthParticle
-        if config.depth_value is None:
-            depth0 = np.full_like(lon0, float(ds["depth"].values[0]), dtype=float)
-        else:
-            depth0 = np.full_like(lon0, float(config.depth_value), dtype=float)
-
-        pset = ParticleSet(
-            fieldset=fieldset,
-            pclass=pclass,
-            lon=lon0,
-            lat=lat0,
-            depth=depth0,
-        )
+        depth0 = np.full_like(lon0, float(ds["depth"].values[0] if config.depth_value is None else config.depth_value))
+        pset = ParticleSet(fieldset=fieldset, pclass=pclass, lon=lon0, lat=lat0, depth=depth0)
     else:
         pclass = SurfaceParticle
-        pset = ParticleSet(
-            fieldset=fieldset,
-            pclass=pclass,
-            lon=lon0,
-            lat=lat0,
-        )
+        pset = ParticleSet(fieldset=fieldset, pclass=pclass, lon=lon0, lat=lat0)
 
     kernel = AdvectionRK4 + pset.Kernel(age_particle)
 
@@ -121,10 +109,8 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         "is_3d_input": meta.is_3d,
         "u_name": meta.u_name,
         "v_name": meta.v_name,
-        "x_name": meta.x_name,
-        "y_name": meta.y_name,
-        "time_name": meta.time_name,
-        "depth_name": meta.depth_name,
-        "release_mode": config.release_mode,
-        "domain": {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax},
     }
+
+
+def load_trajectories(path: str | Path) -> xr.Dataset:
+    return open_trajectory_dataset(path)
