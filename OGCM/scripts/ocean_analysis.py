@@ -296,180 +296,6 @@ def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean
 
     return output_filename
 
-
-# def calculate_EDS(
-#     filepath,
-#     target_box=None,
-#     max_wavelength_km=400.0,
-#     initialized_velocity=False,
-#     x_res=None,
-#     y_res=None,
-#     n_bins=40,
-#     remove_mean=True,
-# ):
-#     """
-#     Calculate an isotropic energy-density spectrum from horizontal velocity fields.
-
-#     Method:
-#     - Compute FFT of u and v separately
-#     - Form 2D kinetic-energy power spectral density
-#     - Radially bin in |k|
-#     - Average over time snapshots
-
-#     Parameters
-#     ----------
-#     filepath : str
-#         Path to NetCDF file.
-#     target_box : list or None
-#         If initialized_velocity=False:
-#             [lon_min, lon_max, lat_min, lat_max]
-#         If initialized_velocity=True:
-#             [x_min, x_max, y_min, y_max] in meters
-#         If None, full horizontal domain is used.
-#     max_wavelength_km : float
-#         Largest wavelength to include in binning.
-#     initialized_velocity : bool
-#         True for initialized MITgcm velocity files on Cartesian x/y grids.
-#         False for lon/lat datasets.
-#     x_res, y_res : float or None
-#         Horizontal grid spacing in meters for initialized_velocity=True.
-#         If None, inferred from x and y coordinates.
-#     n_bins : int
-#         Number of logarithmic radial wavenumber bins.
-#     remove_mean : bool
-#         If True, subtract spatial mean from u and v before FFT.
-
-#     Returns
-#     -------
-#     xr.DataArray
-#         Isotropic energy-density spectrum as function of characteristic length [m].
-#     """
-
-#     ds = xr.open_dataset(filepath)
-
-#     # -------------------------
-#     # 1. Select horizontal box
-#     # -------------------------
-#     if initialized_velocity:
-#         # Cartesian MITgcm-style data
-#         if target_box is None:
-#             box_ds = ds.isel(depth=0)
-#         else:
-#             box_ds = ds.sel(
-#                 x=slice(target_box[0], target_box[1]),
-#                 y=slice(target_box[2], target_box[3])
-#             ).isel(depth=0)
-
-#         x = box_ds.x.values
-#         y = box_ds.y.values
-
-#         if x_res is None:
-#             x_res = float(np.abs(np.mean(np.gradient(x))))
-#         if y_res is None:
-#             y_res = float(np.abs(np.mean(np.gradient(y))))
-
-#         dx = x_res
-#         dy = y_res
-#         nx = len(x)
-#         ny = len(y)
-
-#     else:
-#         # Geographic lon/lat data
-#         if target_box is None:
-#             box_ds = ds.isel(depth=0)
-#         else:
-#             box_ds = ds.sel(
-#                 longitude=slice(target_box[0], target_box[1]),
-#                 latitude=slice(target_box[2], target_box[3])
-#             ).isel(depth=0)
-
-#         R_earth = 6371000.0
-#         phi_lat = float(box_ds.latitude.mean())
-
-#         dlat_deg = np.abs(np.mean(np.gradient(box_ds.latitude.values)))
-#         dlon_deg = np.abs(np.mean(np.gradient(box_ds.longitude.values)))
-
-#         dy = np.deg2rad(dlat_deg) * R_earth
-#         dx = np.deg2rad(dlon_deg) * R_earth * np.cos(np.deg2rad(phi_lat))
-
-#         ny = len(box_ds.latitude)
-#         nx = len(box_ds.longitude)
-
-#     # -------------------------
-#     # 2. Wavenumber grid
-#     # -------------------------
-#     kx = np.fft.fftfreq(nx, d=dx)
-#     ky = np.fft.fftfreq(ny, d=dy)
-#     kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="xy")
-#     k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
-
-#     valid_k = k_mag > 0
-#     k_min = 1.0 / (max_wavelength_km * 1000.0)
-#     k_max = np.nanmax(k_mag[valid_k])
-
-#     k_bins = np.logspace(np.log10(k_min), np.log10(k_max), num=n_bins + 1)
-#     k_centers = np.sqrt(k_bins[:-1] * k_bins[1:])
-
-#     all_daily_spectra = []
-
-#     # -------------------------
-#     # 3. Loop over time
-#     # -------------------------
-#     for t in range(len(box_ds.time)):
-#         u = box_ds.uo.isel(time=t).values
-#         v = box_ds.vo.isel(time=t).values
-
-#         if remove_mean:
-#             u = u - np.nanmean(u)
-#             v = v - np.nanmean(v)
-
-#         # Replace NaNs if needed
-#         u = np.nan_to_num(u, nan=0.0)
-#         v = np.nan_to_num(v, nan=0.0)
-
-#         # FFT of velocity components
-#         u_hat = np.fft.fft2(u)
-#         v_hat = np.fft.fft2(v)
-
-#         # 2D KE power spectral density
-#         # Normalization chosen to be consistent across snapshots/grids
-#         psd_2d = 0.5 * (np.abs(u_hat)**2 + np.abs(v_hat)**2) / (nx * ny)
-
-#         # Radial binning
-#         E_spectrum = np.full(len(k_bins) - 1, np.nan)
-#         N_modes = np.zeros(len(k_bins) - 1)
-
-#         for i in range(len(k_bins) - 1):
-#             mask_bin = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
-#             N_modes[i] = np.sum(mask_bin)
-#             if N_modes[i] > 0:
-#                 E_spectrum[i] = np.nansum(psd_2d[mask_bin])
-
-#         all_daily_spectra.append(E_spectrum)
-
-#     mean_eds = np.nanmean(all_daily_spectra, axis=0)
-
-#     # -------------------------
-#     # 4. Nyquist cutoff
-#     # -------------------------
-#     f_nyquist = 1.0 / (2.0 * max(dx, dy))
-#     nyq_mask = k_centers <= f_nyquist
-
-#     return xr.DataArray(
-#         mean_eds[nyq_mask],
-#         coords=[("characteristic_length", 1.0 / k_centers[nyq_mask])],
-#         name="energy_density_spectrum",
-#         attrs={
-#             "method": "velocity_fft_then_ke_psd",
-#             "initialized_velocity": initialized_velocity,
-#             "dx_m": dx,
-#             "dy_m": dy,
-#             "nyquist_km": (1.0 / f_nyquist) / 1000.0,
-#         },
-#     ).dropna(dim="characteristic_length")
-
-
-
 def calculate_EDS(
     filepath,
     target_box=None,
@@ -477,37 +303,18 @@ def calculate_EDS(
     initialized_velocity=False,
     x_res=None,
     y_res=None,
-    n_bins=40,
+    n_bins=8,
     remove_mean=True,
-    window="tukey",  # None, "hann", "tukey"
-    tukey_alpha=0.2,
-    direction_half_width_deg=15.0,
+    temporal_window_days=7,
+    temporal_skip_days=0,
+    temporal_stride_days=1,
+    min_modes_per_bin=3,
+    rose_scale_bands_km=None,
+    rose_n_angle_bins=12,
 ):
-    """
-    Calculate horizontal KE spectra from 2D velocity fields.
-
-    Returns both:
-    - shell_integrated_spectrum: total KE in each radial wavenumber bin
-    - spectral_density: shell-integrated spectrum divided by bin width dk,
-      which is much more appropriate for slope comparisons in k-space
-
-    Also returns:
-    - zonal_spectrum_density
-    - meridional_spectrum_density
-    - isotropy_ratio = zonal / meridional
-
-    Notes
-    -----
-    - Wavenumbers are in cycles per meter.
-    - characteristic_length = 1 / k_center
-    - For checking -5/3 or -3 slopes, use `spectral_density` and plot against `wavenumber`.
-    """
-
     ds = xr.open_dataset(filepath)
 
-    # ------------------------------------------------------------------
-    # 1. Select horizontal box and infer spacing
-    # ------------------------------------------------------------------
+    # 1. Select box and infer spacing
     if initialized_velocity:
         if target_box is None:
             box_ds = ds.isel(depth=0)
@@ -551,25 +358,25 @@ def calculate_EDS(
         ny = len(box_ds.latitude)
         nx = len(box_ds.longitude)
 
-    # ------------------------------------------------------------------
+    if "time" not in box_ds.dims:
+        raise ValueError("Dataset must contain a time dimension.")
+
+    Lx = nx * dx
+    Ly = ny * dy
+
     # 2. Wavenumber grid
-    # ------------------------------------------------------------------
     kx = np.fft.fftfreq(nx, d=dx)
     ky = np.fft.fftfreq(ny, d=dy)
     kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="xy")
 
     k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
-    theta = np.rad2deg(np.arctan2(ky_grid, kx_grid))
+    theta_rad = np.arctan2(ky_grid, kx_grid)
 
     valid_k = k_mag > 0
     if not np.any(valid_k):
         raise ValueError("No valid nonzero wavenumbers found.")
 
-    # Natural largest resolvable wavelength from box size
-    Lx = nx * dx
-    Ly = ny * dy
     natural_lambda_max = min(Lx, Ly)
-
     if max_wavelength_km is None:
         lambda_max = natural_lambda_max
     else:
@@ -579,179 +386,531 @@ def calculate_EDS(
     k_max = np.nanmax(k_mag[valid_k])
 
     if k_min >= k_max:
-        raise ValueError(
-            "Selected max wavelength is too small relative to the domain/grid."
-        )
+        raise ValueError("Selected max wavelength is too small relative to the domain/grid.")
 
     k_bins = np.logspace(np.log10(k_min), np.log10(k_max), num=n_bins + 1)
     k_centers = np.sqrt(k_bins[:-1] * k_bins[1:])
     dk = np.diff(k_bins)
 
-    # ------------------------------------------------------------------
-    # 3. Window
-    # ------------------------------------------------------------------
-    def tukey_window(n, alpha=0.2):
-        if alpha <= 0:
-            return np.ones(n)
-        if alpha >= 1:
-            return np.hanning(n)
+    shell_masks = []
+    shell_mode_count = np.zeros(n_bins, dtype=int)
+    for i in range(n_bins):
+        shell = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
+        shell_masks.append(shell)
+        shell_mode_count[i] = int(np.sum(shell))
 
-        w = np.ones(n)
-        x = np.linspace(0, 1, n)
+    # 3. Rose setup
+    rose_enabled = rose_scale_bands_km is not None and len(rose_scale_bands_km) > 0
+    if rose_enabled:
+        rose_scale_bands_km = [tuple(b) for b in rose_scale_bands_km]
+        n_rose_bands = len(rose_scale_bands_km)
 
-        first = x < alpha / 2
-        last = x > 1 - alpha / 2
+        rose_angle_edges_deg = np.linspace(-180.0, 180.0, rose_n_angle_bins + 1)
+        rose_angle_centers_deg = 0.5 * (rose_angle_edges_deg[:-1] + rose_angle_edges_deg[1:])
 
-        w[first] = 0.5 * (1 + np.cos(2 * np.pi / alpha * (x[first] - alpha / 2)))
-        w[last] = 0.5 * (1 + np.cos(2 * np.pi / alpha * (x[last] - 1 + alpha / 2)))
-        return w
+        rose_band_masks = []
+        rose_band_labels = []
 
-    if window is None:
-        window_2d = np.ones((ny, nx), dtype=float)
-    elif window == "hann":
-        wx = np.hanning(nx)
-        wy = np.hanning(ny)
-        window_2d = np.outer(wy, wx)
-    elif window == "tukey":
-        wx = tukey_window(nx, alpha=tukey_alpha)
-        wy = tukey_window(ny, alpha=tukey_alpha)
-        window_2d = np.outer(wy, wx)
+        for lam_hi_km, lam_lo_km in rose_scale_bands_km:
+            k_lo = 1.0 / (lam_hi_km * 1000.0)
+            k_hi = 1.0 / (lam_lo_km * 1000.0)
+            rose_band_masks.append((k_mag >= k_lo) & (k_mag < k_hi))
+            rose_band_labels.append(f"{lam_hi_km:g}-{lam_lo_km:g} km")
     else:
-        raise ValueError("window must be None, 'hann', or 'tukey'")
+        n_rose_bands = 0
+        rose_angle_edges_deg = np.array([])
+        rose_angle_centers_deg = np.array([])
+        rose_band_masks = []
+        rose_band_labels = []
 
-    # Normalize window so mean(window^2)=1
-    window_norm = np.sqrt(np.mean(window_2d**2))
-    if window_norm == 0:
-        raise ValueError("Invalid window normalization.")
-    window_2d = window_2d / window_norm
-
-    # ------------------------------------------------------------------
-    # 4. Direction masks
-    # ------------------------------------------------------------------
-    hw = float(direction_half_width_deg)
-
-    def angle_close(angle_deg, center_deg, half_width_deg):
-        diff = (angle_deg - center_deg + 180.0) % 360.0 - 180.0
-        return np.abs(diff) <= half_width_deg
-
-    zonal_mask = angle_close(theta, 0.0, hw) | angle_close(theta, 180.0, hw)
-    meridional_mask = angle_close(theta, 90.0, hw) | angle_close(theta, -90.0, hw)
-
-    all_shell = []
-    all_density = []
-    all_zonal_density = []
-    all_merid_density = []
-
-    # ------------------------------------------------------------------
-    # 5. Time loop
-    # ------------------------------------------------------------------
+    # 4. Snapshot spectra
     n_time = len(box_ds.time)
 
-    for t in range(n_time):
-        u = box_ds.uo.isel(time=t).values
-        v = box_ds.vo.isel(time=t).values
+    spectra_shell = []
+    spectra_density = []
+    spectra_axis_complex = []
+    rose_snapshots = []
 
-        # Mask handling
-        u = np.nan_to_num(u, nan=0.0)
-        v = np.nan_to_num(v, nan=0.0)
+    for t in range(n_time):
+        u = np.nan_to_num(box_ds.uo.isel(time=t).values, nan=0.0)
+        v = np.nan_to_num(box_ds.vo.isel(time=t).values, nan=0.0)
 
         if remove_mean:
             u = u - np.mean(u)
             v = v - np.mean(v)
 
-        u = u * window_2d
-        v = v * window_2d
-
         u_hat = np.fft.fft2(u)
         v_hat = np.fft.fft2(v)
 
-        # 2D KE-like spectral field
-        ke_2d = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (nx * ny)
+        N = nx * ny
+        ke_2d = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (N ** 2)
 
         shell_spectrum = np.full(n_bins, np.nan)
         density_spectrum = np.full(n_bins, np.nan)
-        zonal_density = np.full(n_bins, np.nan)
-        merid_density = np.full(n_bins, np.nan)
+        axis_complex = np.full(n_bins, np.nan + 1j * np.nan, dtype=complex)
 
         for i in range(n_bins):
-            shell = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
+            shell = shell_masks[i]
+            if shell_mode_count[i] < min_modes_per_bin:
+                continue
 
-            shell_zonal = shell & zonal_mask
-            shell_merid = shell & meridional_mask
+            shell_energy = ke_2d[shell]
+            shell_theta = theta_rad[shell]
+            shell_sum = np.nansum(shell_energy)
 
-            if np.any(shell):
-                shell_sum = np.nansum(ke_2d[shell])
-                shell_spectrum[i] = shell_sum
-                density_spectrum[i] = shell_sum / dk[i]
+            if not np.isfinite(shell_sum) or shell_sum <= 0:
+                continue
 
-            if np.any(shell_zonal):
-                zonal_density[i] = np.nansum(ke_2d[shell_zonal]) / dk[i]
+            # only change: normalize shell-integrated spectrum by area
+            shell_spectrum[i] = shell_sum
+            density_spectrum[i] = shell_sum / dk[i]
+            axis_complex[i] = np.nansum(shell_energy * np.exp(2j * shell_theta)) / shell_sum
 
-            if np.any(shell_merid):
-                merid_density[i] = np.nansum(ke_2d[shell_merid]) / dk[i]
+        spectra_shell.append(shell_spectrum)
+        spectra_density.append(density_spectrum)
+        spectra_axis_complex.append(axis_complex)
 
-        all_shell.append(shell_spectrum)
-        all_density.append(density_spectrum)
-        all_zonal_density.append(zonal_density)
-        all_merid_density.append(merid_density)
+        if rose_enabled:
+            rose_band_energy = np.full((n_rose_bands, rose_n_angle_bins), np.nan)
+            for b, band_mask in enumerate(rose_band_masks):
+                band_energy = ke_2d[band_mask]
+                band_theta = np.rad2deg(theta_rad[band_mask])
+                band_sum = np.nansum(band_energy)
 
-    mean_shell = np.nanmean(np.asarray(all_shell), axis=0)
-    mean_density = np.nanmean(np.asarray(all_density), axis=0)
-    mean_zonal_density = np.nanmean(np.asarray(all_zonal_density), axis=0)
-    mean_merid_density = np.nanmean(np.asarray(all_merid_density), axis=0)
+                if not np.isfinite(band_sum) or band_sum <= 0:
+                    continue
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        isotropy_ratio = mean_zonal_density / mean_merid_density
+                vals = np.zeros(rose_n_angle_bins, dtype=float)
+                for j in range(rose_n_angle_bins):
+                    m = (band_theta >= rose_angle_edges_deg[j]) & (band_theta < rose_angle_edges_deg[j + 1])
+                    vals[j] = np.nansum(band_energy[m]) if np.any(m) else 0.0
 
-    # ------------------------------------------------------------------
+                rose_band_energy[b, :] = vals
+
+            rose_snapshots.append(rose_band_energy)
+
+    spectra_shell = np.asarray(spectra_shell)
+    spectra_density = np.asarray(spectra_density)
+    spectra_axis_complex = np.asarray(spectra_axis_complex)
+    if rose_enabled:
+        rose_snapshots = np.asarray(rose_snapshots)
+
+    # 5. Temporal averaging
+    if n_time < temporal_window_days:
+        raise ValueError(f"Dataset has only {n_time} time steps, but temporal_window_days={temporal_window_days}.")
+
+    sample_step = temporal_skip_days + 1
+    window_starts = np.arange(0, n_time - temporal_window_days + 1, temporal_stride_days)
+
+    window_shell_means = []
+    window_density_means = []
+    window_axis_means = []
+    window_rose_means = []
+
+    for start in window_starts:
+        idx = np.arange(start, start + temporal_window_days, sample_step)
+
+        window_shell_means.append(np.nanmean(spectra_shell[idx, :], axis=0))
+        window_density_means.append(np.nanmean(spectra_density[idx, :], axis=0))
+        window_axis_means.append(np.nanmean(spectra_axis_complex[idx, :], axis=0))
+
+        if rose_enabled:
+            window_rose_means.append(np.nanmean(rose_snapshots[idx, :, :], axis=0))
+
+    window_shell_means = np.asarray(window_shell_means)
+    window_density_means = np.asarray(window_density_means)
+    window_axis_means = np.asarray(window_axis_means)
+
+    mean_shell = np.nanmean(window_shell_means, axis=0)
+    std_shell = np.nanstd(window_shell_means, axis=0)
+
+    mean_density = np.nanmean(window_density_means, axis=0)
+    std_density = np.nanstd(window_density_means, axis=0)
+
+    mean_axis = np.nanmean(window_axis_means, axis=0)
+    anisotropy_strength = np.abs(mean_axis)
+    dominant_axis_deg = np.mod(0.5 * np.rad2deg(np.angle(mean_axis)), 180.0)
+
+    if rose_enabled:
+        window_rose_means = np.asarray(window_rose_means)
+        mean_rose = np.nanmean(window_rose_means, axis=0)
+        rose_row_sums = np.nansum(mean_rose, axis=1, keepdims=True)
+        rose_normalized = np.divide(
+            mean_rose,
+            rose_row_sums,
+            out=np.full_like(mean_rose, np.nan, dtype=float),
+            where=rose_row_sums > 0,
+        )
+    else:
+        mean_rose = np.empty((0, 0))
+        rose_normalized = np.empty((0, 0))
+
     # 6. Nyquist cutoff
-    # ------------------------------------------------------------------
     f_nyquist = 1.0 / (2.0 * max(dx, dy))
     nyq_mask = k_centers <= f_nyquist
 
-    out = xr.Dataset(
-        data_vars={
-            "shell_integrated_spectrum": (
-                ("wavenumber",),
-                mean_shell[nyq_mask],
-            ),
-            "spectral_density": (
-                ("wavenumber",),
-                mean_density[nyq_mask],
-            ),
-            "zonal_spectrum_density": (
-                ("wavenumber",),
-                mean_zonal_density[nyq_mask],
-            ),
-            "meridional_spectrum_density": (
-                ("wavenumber",),
-                mean_merid_density[nyq_mask],
-            ),
-            "isotropy_ratio": (
-                ("wavenumber",),
-                isotropy_ratio[nyq_mask],
-            ),
-        },
-        coords={
-            "wavenumber": k_centers[nyq_mask],
-            "characteristic_length": ("wavenumber", 1.0 / k_centers[nyq_mask]),
-        },
+    data_vars = {
+        "shell_integrated_spectrum": (("wavenumber",), mean_shell[nyq_mask]),
+        "shell_integrated_spectrum_std": (("wavenumber",), std_shell[nyq_mask]),
+        "spectral_density": (("wavenumber",), mean_density[nyq_mask]),
+        "spectral_density_std": (("wavenumber",), std_density[nyq_mask]),
+        "dominant_axis_deg": (("wavenumber",), dominant_axis_deg[nyq_mask]),
+        "anisotropy_strength": (("wavenumber",), anisotropy_strength[nyq_mask]),
+        "shell_mode_count": (("wavenumber",), shell_mode_count[nyq_mask]),
+    }
+
+    coords = {
+        "wavenumber": k_centers[nyq_mask],
+        "characteristic_length": (("wavenumber",), 1.0 / k_centers[nyq_mask]),
+    }
+
+    if rose_enabled:
+        data_vars["rose_spectrum"] = (("scale_band", "rose_angle_deg"), mean_rose)
+        data_vars["rose_spectrum_normalized"] = (("scale_band", "rose_angle_deg"), rose_normalized)
+        coords["scale_band"] = np.array(rose_band_labels, dtype=object)
+        coords["rose_angle_deg"] = rose_angle_centers_deg
+
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
         attrs={
             "dx_m": dx,
             "dy_m": dy,
             "domain_Lx_km": Lx / 1000.0,
             "domain_Ly_km": Ly / 1000.0,
-            "natural_lambda_max_km": natural_lambda_max / 1000.0,
-            "used_lambda_max_km": lambda_max / 1000.0,
-            "nyquist_km": (1.0 / f_nyquist) / 1000.0,
-            "window": "none" if window is None else window,
-            "tukey_alpha": tukey_alpha if window == "tukey" else np.nan,
-            "notes": (
-                "shell_integrated_spectrum = total KE per radial shell; "
-                "spectral_density = shell_integrated_spectrum / dk, "
-                "recommended for slope comparisons in k-space."
-            ),
         },
+    ).dropna(dim="wavenumber", how="all")
+
+
+def plot_eds_overview(
+    eds,
+    title="Spectrum and anisotropy overview",
+    target_box=None,
+):
+    """
+    Overview figure with:
+    - top: shell-integrated spectrum vs characteristic length
+    - middle: spectral density vs wavenumber
+    - bottom: single rose plot (first / only scale band)
+    """
+
+    if "rose_spectrum_normalized" not in eds:
+        raise ValueError("Dataset does not contain rose_spectrum_normalized.")
+    
+    coord_label = ""
+    if target_box is not None:
+        lon_w, lon_e, lat_s, lat_n = target_box
+        coord_label = (
+            f"{lat_s:.2f}–{lat_n:.2f}°N, "
+            f"{abs(lon_w):.2f}–{abs(lon_e):.2f}°W"
+        )
+
+    # -----------------------------
+    # Extract data
+    # -----------------------------
+    length_km = eds["characteristic_length"].values / 1000.0
+
+    E_shell = eds["shell_integrated_spectrum"].values
+    E_shell_std = eds["shell_integrated_spectrum_std"].values
+
+    k = eds["wavenumber"].values
+    E_k = eds["spectral_density"].values
+    E_k_std = eds["spectral_density_std"].values
+
+    rose = eds["rose_spectrum_normalized"].values
+    rose_angles_deg = eds["rose_angle_deg"].values
+    rose_labels = eds["scale_band"].values
+
+    if rose.shape[0] < 1:
+        raise ValueError("No rose scale band found in rose_spectrum_normalized.")
+
+    # Use only the first rose band
+    rose_vals = rose[0]
+    rose_label = str(rose_labels[0])
+
+    # -----------------------------
+    # Styling
+    # -----------------------------
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titlesize": 12,
+        "axes.labelsize": 12,
+        "legend.fontsize": 10,
+    })
+
+    fig = plt.figure(figsize=(8.5, 12.5), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.05, 1.2], hspace=0.18)
+
+    # -----------------------------
+    # A. Shell-integrated spectrum
+    # -----------------------------
+    ax1 = fig.add_subplot(gs[0, 0])
+
+    valid1 = np.isfinite(length_km) & np.isfinite(E_shell) & (length_km > 0) & (E_shell > 0)
+
+    ax1.loglog(
+        length_km[valid1],
+        E_shell[valid1],
+        "-o",
+        lw=2.0,
+        ms=5,
+        color="tab:blue",
+        label="Shell-integrated KE",
     )
 
-    return out.dropna(dim="wavenumber", how="all")
+    if np.any(np.isfinite(E_shell_std[valid1])):
+        lo = np.maximum(E_shell[valid1] - E_shell_std[valid1], 1e-30)
+        hi = E_shell[valid1] + E_shell_std[valid1]
+        ax1.fill_between(
+            length_km[valid1],
+            lo,
+            hi,
+            color="tab:blue",
+            alpha=0.15,
+            linewidth=0,
+        )
+
+    ax1.set_xlabel("Characteristic length (km)")
+    ax1.set_ylabel(r"Shell contribution to mean KE (m$^2$ s$^{-2}$)")
+    ax1.set_title("A. Shell-integrated spectrum", pad=14)
+    ax1.grid(True, which="both", alpha=0.22)
+    ax1.legend(
+    handles=[
+        ax1.lines[0],
+        patches.Patch(facecolor="tab:blue", alpha=0.15, edgecolor="none"),
+    ],
+    labels=[
+        "Shell-integrated KE",
+        r"$\pm 1$ std. dev.",
+    ],
+    loc="upper right",
+    frameon=True,
+    )
+
+    # -----------------------------
+    # B. Spectral density
+    # -----------------------------
+    ax2 = fig.add_subplot(gs[1, 0])
+
+    valid2 = np.isfinite(k) & np.isfinite(E_k) & (k > 0) & (E_k > 0)
+
+    ax2.loglog(
+        k[valid2],
+        E_k[valid2],
+        "-o",
+        lw=2.0,
+        ms=5,
+        color="tab:orange",
+        label="Spectral density",
+    )
+
+    if np.any(np.isfinite(E_k_std[valid2])):
+        lo = np.maximum(E_k[valid2] - E_k_std[valid2], 1e-30)
+        hi = E_k[valid2] + E_k_std[valid2]
+        ax2.fill_between(
+            k[valid2],
+            lo,
+            hi,
+            color="tab:orange",
+            alpha=0.15,
+            linewidth=0,
+        )
+
+    if np.sum(valid2) >= 3:
+        k_plot = k[valid2]
+        E_plot = E_k[valid2]
+
+        mid = len(k_plot) // 2
+        k0 = k_plot[mid]
+        E0 = E_plot[mid]
+
+        k_ref = np.array([k_plot[0], k_plot[-1]])
+        y_53 = E0 * (k_ref / k0) ** (-5 / 3)
+        y_3 = E0 * (k_ref / k0) ** (-3)
+
+        ax2.loglog(k_ref, y_53, "--", color="0.45", lw=1.8, alpha=0.9, label=r"$k^{-5/3}$")
+        ax2.loglog(k_ref, y_3, "--", color="royalblue", lw=1.8, alpha=0.9, label=r"$k^{-3}$")
+
+    ax2.set_xlabel(r"Wavenumber $k$ (cycles m$^{-1}$)")
+    ax2.set_ylabel(r"Spectral density ((m$^2$ s$^{-2}$)/(cycles m$^{-1}$))")
+    ax2.set_title("B. Spectral density", pad=8)
+    ax2.grid(True, which="both", alpha=0.22)
+    ax2.legend(
+    handles=[
+        ax2.lines[0],
+        patches.Patch(facecolor="tab:orange", alpha=0.15, edgecolor="none", label=r"$\pm 1$ std. dev."),
+        ax2.lines[1],
+        ax2.lines[2],
+    ],
+    loc="upper right",
+    frameon=True,
+    )
+    
+    legend_handles = [
+    ax2.lines[0],
+    patches.Patch(facecolor="tab:orange", alpha=0.15, edgecolor="none"),
+    ]
+    legend_labels = [
+        "Spectral density",
+        r"$\pm 1$ std. dev.",
+    ]
+
+    if len(ax2.lines) > 1:
+        legend_handles.extend(ax2.lines[1:])
+        legend_labels.extend([line.get_label() for line in ax2.lines[1:]])
+
+    ax2.legend(
+        handles=legend_handles,
+        labels=legend_labels,
+        loc="upper right",
+        frameon=True,
+    )
+
+
+    # -----------------------------
+    # C. Single rose plot
+    # -----------------------------
+    axr = fig.add_subplot(gs[2, 0], projection="polar")
+    axr.set_anchor("C")
+
+    angle_rad = np.deg2rad(rose_angles_deg)
+    dtheta = 2 * np.pi / len(rose_angles_deg)
+    vals = np.nan_to_num(rose_vals, nan=0.0)
+
+    axr.bar(
+        angle_rad,
+        vals,
+        width=dtheta,
+        align="center",
+        color="tab:blue",
+        edgecolor="white",
+        linewidth=0.8,
+        alpha=0.9,
+    )
+
+    axr.set_theta_zero_location("E")
+    axr.set_theta_direction(1)
+
+    vmax = np.nanmax(vals)
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    axr.set_ylim(0, vmax * 1.1)
+
+    # sparse radial labels
+    rticks = np.linspace(0, vmax, 5)[1:]
+    axr.set_rticks(rticks)
+    axr.set_yticklabels([f"{r:.2f}" for r in rticks])
+    axr.set_rlabel_position(135)
+
+    axr.grid(alpha=0.35)
+    axr.set_title(f"C. Angular energy distribution integrated over ({rose_label}) length scales", va="bottom", pad=14)
+
+    full_title = title if coord_label == "" else f"{title}\n{coord_label}"
+    fig.suptitle(full_title, fontsize=15, y=1.04)
+    plt.show()
+
+
+
+
+
+def plot_EDS_seasonal(
+    data_groups,
+    target_box,
+    initialized_velocity=False,
+    max_wavelength_km=None,
+    n_bins=8,
+    remove_mean=True,
+    temporal_window_days=31,
+    temporal_skip_days=0,
+    temporal_stride_days=1,
+    min_modes_per_bin=3,
+    spectrum_var="shell_integrated_spectrum",  # or "spectral_density"
+    base_colors=None,
+    title="Seasonal energy spectrum comparison",
+    xlim_km=None,
+):
+    """
+    Plot seasonal / yearly comparison of EDS using the current calculate_EDS method.
+
+    Parameters
+    ----------
+    data_groups : dict
+        Example:
+        {
+            "Winter": {"2020": "...", "2021": "..."},
+            "Summer": {"2020": "...", "2021": "..."},
+        }
+    target_box : list
+        [lon_min, lon_max, lat_min, lat_max] for lon/lat data,
+        or [x_min, x_max, y_min, y_max] for initialized Cartesian data.
+    spectrum_var : str
+        Either:
+        - "shell_integrated_spectrum"
+        - "spectral_density"
+    """
+
+    if base_colors is None:
+        base_colors = {
+            "Winter": "Blues",
+            "Summer": "Reds",
+            "Spring": "Greens",
+            "Autumn": "Oranges",
+        }
+
+    ylabel_map = {
+        "shell_integrated_spectrum": r"Shell contribution to mean KE (m$^2$ s$^{-2}$)",
+        "spectral_density": r"Spectral density ((m$^2$ s$^{-2}$)/(m$^{-1}$))",
+    }
+
+    if spectrum_var not in ylabel_map:
+        raise ValueError("spectrum_var must be 'shell_integrated_spectrum' or 'spectral_density'")
+
+    plt.figure(figsize=(10, 7))
+
+    for season, years in data_groups.items():
+        cmap = plt.get_cmap(base_colors.get(season, "viridis"))
+        shades = np.linspace(0.4, 0.9, len(years))
+
+        for idx, (year_label, path) in enumerate(years.items()):
+            eds = calculate_EDS(
+                filepath=path,
+                target_box=target_box,
+                initialized_velocity=initialized_velocity,
+                max_wavelength_km=max_wavelength_km,
+                n_bins=n_bins,
+                remove_mean=remove_mean,
+                temporal_window_days=temporal_window_days,
+                temporal_skip_days=temporal_skip_days,
+                temporal_stride_days=temporal_stride_days,
+                min_modes_per_bin=min_modes_per_bin,
+                rose_scale_bands_km=None,  # not needed for this plot
+            )
+
+            length_km = eds["characteristic_length"].values / 1000.0
+            E = eds[spectrum_var].values
+
+            valid = np.isfinite(length_km) & np.isfinite(E) & (length_km > 0) & (E > 0)
+
+            plt.loglog(
+                length_km[valid],
+                E[valid],
+                "-o",
+                label=f"{season} {year_label}",
+                color=cmap(shades[idx]),
+                lw=2,
+                ms=5,
+                alpha=0.95,
+            )
+
+    plt.xlabel("Characteristic length (km)")
+    plt.ylabel(ylabel_map[spectrum_var])
+    plt.title(title, fontsize=14)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.grid(True, which="both", alpha=0.2)
+
+    if xlim_km is not None:
+        plt.xlim(xlim_km)
+
+    plt.tight_layout()
+    plt.show()
