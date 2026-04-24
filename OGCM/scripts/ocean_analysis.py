@@ -43,58 +43,6 @@ def get_subdomain(lat_min, lon_min, lat_max, lon_max):
     return [lon_min, lon_max, lat_min, lat_max]
 
 
-# def calculate_coriolis_beta_plane(ds_slice):
-#     """
-#     Calculates the Coriolis parameter f using the beta-plane approximation.
-#     f = f0 + beta * y
-#     """
-#     omega_earth = 7.2921e-5  # Earth's angular velocity [rad/s]
-#     R = 6371000             # Earth's radius [m]
-    
-#     # Identify lat dimension name
-#     lat_dim = 'latitude' if 'latitude' in ds_slice.dims else 'lat'
-    
-#     # 1. Define reference latitude (center of the domain)
-#     phi_0_deg = float(ds_slice[lat_dim].mean())
-#     phi_0_rad = np.deg2rad(phi_0_deg)
-    
-#     # 2. Calculate constants
-#     f0 = 2 * omega_earth * np.sin(phi_0_rad)
-#     beta = (2 * omega_earth * np.cos(phi_0_rad)) / R
-    
-#     # 3. Calculate y (meridional distance from the center in meters)
-#     y = (ds_slice[lat_dim] - phi_0_deg) * (np.pi * R / 180)
-    
-#     f = f0 + beta * y
-#     return f.assign_attrs(units='s^-1', long_name='Coriolis parameter (beta-plane)')
-
-# def get_eddy_intensity(results, alpha=0.2):
-#     """
-#     Returns the vorticity field only where OW passes the threshold.
-#     This allows us to see:
-#     1. Strength (magnitude of vorticity)
-#     2. Rotation sign (Cyclonic > 0, Anticyclonic < 0 in NH)
-#     """
-#     ow_param = results.w
-#     vorticity = results.vorticity
-    
-#     # Identify dims for standard deviation
-#     dims_to_std = [d for d in ['latitude', 'longitude', 'lat', 'lon'] if d in ow_param.coords]
-    
-#     sigma_W = ow_param.std(dim=dims_to_std)
-#     ow_threshold = -alpha * sigma_W
-    
-#     # Create the binary mask
-#     mask = xr.where(ow_param < ow_threshold, 1, 0)
-    
-#     # Proxy for Intensity: Relative Vorticity masked by OW
-#     # Positive values = Cyclonic, Negative = Anticyclonic (Northern Hemisphere)
-#     signed_intensity = vorticity.where(mask == 1)
-    
-#     # Optional: Normalize by Coriolis to get Rossby Number cores
-#     ro_intensity = (vorticity / results.f).where(mask == 1)
-    
-#     return signed_intensity, ro_intensity, mask
 
 def get_eddy_intensity(results, alpha=0.2):
     """
@@ -582,6 +530,8 @@ def calculate_EDS(
     ).dropna(dim="wavenumber", how="all")
 
 
+
+
 def plot_eds_overview(
     eds,
     title="Spectrum and anisotropy overview",
@@ -806,11 +756,263 @@ def plot_eds_overview(
     axr.grid(alpha=0.35)
     axr.set_title(f"C. Angular energy distribution integrated over ({rose_label}) length scales", va="bottom", pad=14)
 
-    full_title = title if coord_label == "" else f"{title}\n{coord_label}"
-    fig.suptitle(full_title, fontsize=15, y=1.04)
+    fig.suptitle(title, fontsize=15, y=1.04)
     plt.show()
 
 
+def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=None, y_res=None,
+                       n_bins=8, remove_mean=True, min_modes_per_bin=3, rose_scale_bands_km=None,
+                       rose_n_angle_bins=12, snapshot_index=None):
+    ds = xr.open_dataset(filepath)
+    print(ds)
+
+    # Step 1: Automatically determine the correct dimension for depth
+    depth_dim = None
+    for dim in ds.dims:
+        if "Z" in dim or "depth" in dim.lower():
+            depth_dim = dim
+            break
+
+    if depth_dim is None:
+        raise ValueError("No depth-like dimension found in the dataset.")
+
+    # Check what depth dimension is used
+    print(f"Depth dimension: {depth_dim}")
+
+    # Select the surface layer (depth=0)
+    if target_box is None:
+        box_ds = ds.isel({depth_dim: 0})
+    else:
+        x_coord = 'X' if 'X' in ds.coords else 'x'
+        y_coord = 'Y' if 'Y' in ds.coords else 'y'
+        box_ds = ds.sel(
+            **{x_coord: slice(target_box[0], target_box[1]),
+               y_coord: slice(target_box[2], target_box[3])}
+        ).isel({depth_dim: 0})
+
+    box_ds['UVEL'] = box_ds['UVEL'].interp(Xp1=box_ds['X'])
+    box_ds['VVEL'] = box_ds['VVEL'].interp(Yp1=box_ds['Y'])
+
+    print(f"Selected box shape UVEL: {box_ds['UVEL'].shape}")
+    print(f"Selected box shape VVEL: {box_ds['VVEL'].shape}")
+
+    x_coord = 'X'
+    y_coord = 'Y'
+    x = box_ds[x_coord].values
+    y = box_ds[y_coord].values
+
+    if x_res is None:
+        x_res = float(np.abs(np.mean(np.gradient(x))))
+    if y_res is None:
+        y_res = float(np.abs(np.mean(np.gradient(y))))
+
+    dx = x_res
+    dy = y_res
+    nx = len(x)
+    ny = len(y)
+
+    Lx = nx * dx
+    Ly = ny * dy
+
+    kx = np.fft.fftfreq(nx, d=dx)
+    ky = np.fft.fftfreq(ny, d=dy)
+    kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="xy")
+
+    k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
+    theta_rad = np.arctan2(ky_grid, kx_grid)
+
+    valid_k = k_mag > 0
+    if not np.any(valid_k):
+        raise ValueError("No valid nonzero wavenumbers found.")
+
+    natural_lambda_max = min(Lx, Ly)
+    if max_wavelength_km is None:
+        lambda_max = natural_lambda_max
+    else:
+        lambda_max = min(max_wavelength_km * 1000.0, natural_lambda_max)
+
+    k_min = 1.0 / lambda_max
+    k_max = np.nanmax(k_mag[valid_k])
+
+    if k_min >= k_max:
+        raise ValueError("Selected max wavelength is too small relative to the domain/grid.")
+
+    k_bins = np.logspace(np.log10(k_min), np.log10(k_max), num=n_bins + 1)
+    k_centers = np.sqrt(k_bins[:-1] * k_bins[1:])
+    dk = np.diff(k_bins)
+
+    shell_masks = []
+    shell_mode_count = np.zeros(n_bins, dtype=int)
+    for i in range(n_bins):
+        shell = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
+        shell_masks.append(shell)
+        shell_mode_count[i] = int(np.sum(shell))
+
+    rose_enabled = rose_scale_bands_km is not None and len(rose_scale_bands_km) > 0
+    if rose_enabled:
+        rose_scale_bands_km = [tuple(b) for b in rose_scale_bands_km]
+        n_rose_bands = len(rose_scale_bands_km)
+
+        rose_angle_edges_deg = np.linspace(-180.0, 180.0, rose_n_angle_bins + 1)
+        rose_angle_centers_deg = 0.5 * (rose_angle_edges_deg[:-1] + rose_angle_edges_deg[1:])
+
+        rose_band_masks = []
+        rose_band_labels = []
+
+        for lam_hi_km, lam_lo_km in rose_scale_bands_km:
+            k_lo = 1.0 / (lam_hi_km * 1000.0)
+            k_hi = 1.0 / (lam_lo_km * 1000.0)
+            rose_band_masks.append((k_mag >= k_lo) & (k_mag < k_hi))
+            rose_band_labels.append(f"{lam_hi_km:g}-{lam_lo_km:g} km")
+    else:
+        n_rose_bands = 0
+        rose_angle_edges_deg = np.array([])
+        rose_angle_centers_deg = np.array([])
+        rose_band_masks = []
+        rose_band_labels = []
+
+    time_coord = 'T' if 'T' in box_ds.dims else ('time' if 'time' in box_ds.dims else None)
+    if time_coord is None:
+        raise ValueError("No time dimension found in the dataset.")
+
+    n_time = len(box_ds[time_coord])
+    if snapshot_index is not None:
+        if snapshot_index < 0 or snapshot_index >= n_time:
+            raise IndexError(f"snapshot_index={snapshot_index} is outside the available time range 0..{n_time - 1}")
+        selected_time_indices = [snapshot_index]
+    else:
+        selected_time_indices = np.arange(n_time)
+
+    spectra_shell = []
+    spectra_density = []
+    spectra_axis_complex = []
+    rose_snapshots = []
+
+    for t in selected_time_indices:
+        u = np.nan_to_num(box_ds["UVEL"].isel(**{time_coord: t}).values, nan=0.0)
+        v = np.nan_to_num(box_ds["VVEL"].isel(**{time_coord: t}).values, nan=0.0)
+
+        if remove_mean:
+            u = u - np.mean(u)
+            v = v - np.mean(v)
+
+        u_hat = np.fft.fft2(u)
+        v_hat = np.fft.fft2(v)
+
+        N = nx * ny
+        ke_2d = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (N ** 2)
+
+        shell_spectrum = np.full(n_bins, np.nan)
+        density_spectrum = np.full(n_bins, np.nan)
+        axis_complex = np.full(n_bins, np.nan + 1j * np.nan, dtype=complex)
+
+        for i in range(n_bins):
+            shell = shell_masks[i]
+            if shell_mode_count[i] < min_modes_per_bin:
+                continue
+
+            shell_energy = ke_2d[shell]
+            shell_theta = theta_rad[shell]
+            shell_sum = np.nansum(shell_energy)
+
+            if not np.isfinite(shell_sum) or shell_sum <= 0:
+                continue
+
+            shell_spectrum[i] = shell_sum
+            density_spectrum[i] = shell_sum / dk[i]
+            axis_complex[i] = np.nansum(shell_energy * np.exp(2j * shell_theta)) / shell_sum
+
+        spectra_shell.append(shell_spectrum)
+        spectra_density.append(density_spectrum)
+        spectra_axis_complex.append(axis_complex)
+
+        if rose_enabled:
+            rose_band_energy = np.full((n_rose_bands, rose_n_angle_bins), np.nan)
+            for b, band_mask in enumerate(rose_band_masks):
+                band_energy = ke_2d[band_mask]
+                band_theta = np.rad2deg(theta_rad[band_mask])
+                band_sum = np.nansum(band_energy)
+
+                if not np.isfinite(band_sum) or band_sum <= 0:
+                    continue
+
+                vals = np.zeros(rose_n_angle_bins, dtype=float)
+                for j in range(rose_n_angle_bins):
+                    m = (band_theta >= rose_angle_edges_deg[j]) & (band_theta < rose_angle_edges_deg[j + 1])
+                    vals[j] = np.nansum(band_energy[m]) if np.any(m) else 0.0
+
+                rose_band_energy[b, :] = vals
+
+            rose_snapshots.append(rose_band_energy)
+
+    spectra_shell = np.asarray(spectra_shell)
+    spectra_density = np.asarray(spectra_density)
+    spectra_axis_complex = np.asarray(spectra_axis_complex)
+    if rose_enabled:
+        rose_snapshots = np.asarray(rose_snapshots)
+    else:
+        rose_snapshots = np.empty((0, 0, 0))
+
+    mean_shell = np.nanmean(spectra_shell, axis=0)
+    std_shell = np.nanstd(spectra_shell, axis=0)
+
+    mean_density = np.nanmean(spectra_density, axis=0)
+    std_density = np.nanstd(spectra_density, axis=0)
+
+    mean_axis = np.nanmean(spectra_axis_complex, axis=0)
+    anisotropy_strength = np.abs(mean_axis)
+    dominant_axis_deg = np.mod(0.5 * np.rad2deg(np.angle(mean_axis)), 180.0)
+
+    if rose_enabled:
+        mean_rose = np.nanmean(rose_snapshots, axis=0)
+        rose_row_sums = np.nansum(mean_rose, axis=1, keepdims=True)
+        rose_normalized = np.divide(
+            mean_rose,
+            rose_row_sums,
+            out=np.full_like(mean_rose, np.nan, dtype=float),
+            where=rose_row_sums > 0,
+        )
+    else:
+        mean_rose = np.empty((0, 0))
+        rose_normalized = np.empty((0, 0))
+
+    if snapshot_index is None:
+        snapshot_time_index = None
+        snapshot_time_value = "all timesteps"
+    else:
+        snapshot_time_index = int(snapshot_index)
+
+    data_vars = {
+        "shell_integrated_spectrum": (("wavenumber",), mean_shell),
+        "shell_integrated_spectrum_std": (("wavenumber",), std_shell),
+        "spectral_density": (("wavenumber",), mean_density),
+        "spectral_density_std": (("wavenumber",), std_density),
+        "dominant_axis_deg": (("wavenumber",), dominant_axis_deg),
+        "anisotropy_strength": (("wavenumber",), anisotropy_strength),
+    }
+
+    coords = {
+        "wavenumber": k_centers,
+        "characteristic_length": (("wavenumber",), 1.0 / k_centers),
+    }
+
+    if rose_enabled:
+        data_vars["rose_spectrum"] = (("scale_band", "rose_angle_deg"), mean_rose)
+        data_vars["rose_spectrum_normalized"] = (("scale_band", "rose_angle_deg"), rose_normalized)
+        coords["scale_band"] = np.array(rose_band_labels, dtype=object)
+        coords["rose_angle_deg"] = rose_angle_centers_deg
+
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "dx_m": dx,
+            "dy_m": dy,
+            "domain_Lx_km": Lx / 1000.0,
+            "domain_Ly_km": Ly / 1000.0,
+            "snapshot_time_index": snapshot_time_index,
+        },
+    ).dropna(dim="wavenumber", how="all")
 
 
 
