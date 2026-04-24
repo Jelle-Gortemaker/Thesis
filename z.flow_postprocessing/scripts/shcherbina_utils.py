@@ -142,7 +142,6 @@ def plot_map(field, title="", cbar_label="", cmap=None, vmin=None, vmax=None,
     plt.ylabel("y [km]")
     plt.title(title)
     plt.tight_layout()
-    plt.show()
 
 
 def plot_pdf(x, y, xlabel="", title="", figsize=(6, 4)):
