@@ -6,6 +6,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import os
 import sys
+from pathlib import Path
 
 def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0, time_range=None):
     """
@@ -245,134 +246,157 @@ def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean
     return output_filename
 
 
-def slice_vertical_layers(
-    input_nc: str,
-    output_nc: str,
-    n_layers: int,
-    depth_dim: str | None = None,
-    from_surface: bool = True,
-    variables: list[str] | None = None,
-    time_index: int | None = None,
-    compression_level: int = 4,
-) -> None:
+def infer_horizontal_dims(da, depth_dim):
     """
-    Slice the upper or lower N vertical layers from a NetCDF file.
+    Infer y and x dimensions from a DataArray.
+    Assumes remaining spatial dims after removing depth/time are ordered as y, x,
+    or named with y/lat and x/lon.
+    """
 
-    Parameters
-    ----------
-    input_nc : str
-        Path to input NetCDF file.
-    output_nc : str
-        Path to output sliced NetCDF file.
-    n_layers : int
-        Number of vertical layers to keep.
-    depth_dim : str | None
-        Name of the vertical/depth dimension. If None, the function tries to infer it.
-        Common GLORYS names are 'depth', 'deptht', 'lev', 'z', or 'nav_lev'.
-    from_surface : bool
-        If True, keep the first n_layers, assuming depth increases downward.
-        If False, keep the deepest n_layers.
-    variables : list[str] | None
-        Optional list of variables to keep, e.g. ['uo', 'vo', 'thetao', 'so'].
-        If None, all variables are kept.
-    time_index : int | None
-        Optional time index to keep. If None, all time steps are kept.
-    compression_level : int
-        NetCDF compression level from 0 to 9.
+    ignored_dims = {depth_dim, "time", "time_counter", "t"}
+    spatial_dims = [dim for dim in da.dims if dim not in ignored_dims]
 
-    Returns
-    -------
-    None
-        Writes the sliced NetCDF file to output_nc.
+    if len(spatial_dims) != 2:
+        raise ValueError(
+            f"Could not infer exactly two horizontal dimensions from {da.name}. "
+            f"DataArray dims are {da.dims}, after ignoring {ignored_dims} got {spatial_dims}."
+        )
+
+    y_names = ["y", "lat", "latitude", "YC", "y_u", "y_v", "y_t"]
+    x_names = ["x", "lon", "longitude", "XC", "x_u", "x_v", "x_t"]
+
+    y_dim = next(
+        (dim for dim in spatial_dims if dim in y_names or dim.lower().startswith("y")),
+        None,
+    )
+    x_dim = next(
+        (dim for dim in spatial_dims if dim in x_names or dim.lower().startswith("x")),
+        None,
+    )
+
+    if y_dim is None or x_dim is None:
+        y_dim, x_dim = spatial_dims
+
+    return y_dim, x_dim
+
+
+def slice_vertical_layers(
+    input_nc,
+    output_nc,
+    n_layers,
+    depth_dim=None,
+    variables=None,
+    time_index=None,
+    dtype=">f4",
+):
+    """
+    Slice the upper n_layers from a NetCDF file and write MITgcm-ready
+    binary velocity files.
+
+    output_nc is used as a naming template only.
+
+    Example:
+        output_nc="../data/MITgcm_interp_256x256_aug2020_surface.nc"
+
+    writes:
+        "../data/MITgcm_interp_256x256_aug2020_surface_uvel.bin"
+        "../data/MITgcm_interp_256x256_aug2020_surface_vvel.bin"
     """
 
     input_nc = Path(input_nc)
     output_nc = Path(output_nc)
 
     if not input_nc.exists():
-        raise FileNotFoundError(f"Input file does not exist: {input_nc}")
+        raise FileNotFoundError(f"Input file not found: {input_nc}")
 
     if n_layers < 1:
         raise ValueError("n_layers must be at least 1.")
 
-    ds = xr.open_dataset(input_nc, chunks="auto")
+    if variables is None:
+        variables = ["u_mit", "v_mit"]
 
-    # Infer depth dimension if not provided
+    if len(variables) != 2:
+        raise ValueError("variables should contain exactly two names: [u_variable, v_variable].")
+
+    u_var, v_var = variables
+
+    ds = xr.open_dataset(input_nc)
+
+    if u_var not in ds.data_vars or v_var not in ds.data_vars:
+        available = list(ds.data_vars)
+        ds.close()
+        raise ValueError(
+            f"Velocity variables not found. Requested {variables}. "
+            f"Available variables: {available}"
+        )
+
     if depth_dim is None:
-        possible_depth_dims = ["depth", "deptht", "depthu", "depthv", "lev", "z", "nav_lev"]
-        matches = [dim for dim in possible_depth_dims if dim in ds.dims]
+        depth_candidates = ["z", "depth", "deptht", "depthu", "depthv", "lev", "nav_lev"]
+        matches = [dim for dim in depth_candidates if dim in ds.dims]
 
-        if len(matches) == 0:
+        if not matches:
+            ds.close()
             raise ValueError(
-                f"Could not infer depth dimension. Available dimensions are: {list(ds.dims)}. "
-                "Please provide depth_dim explicitly."
+                f"Could not infer depth dimension. Available dimensions: {list(ds.dims)}"
             )
 
         depth_dim = matches[0]
 
     if depth_dim not in ds.dims:
+        ds.close()
         raise ValueError(
-            f"Depth dimension '{depth_dim}' not found. Available dimensions are: {list(ds.dims)}"
+            f"Depth dimension '{depth_dim}' not found. Available dimensions: {list(ds.dims)}"
         )
 
-    n_available = ds.sizes[depth_dim]
-
-    if n_layers > n_available:
+    if n_layers > ds.sizes[depth_dim]:
+        n_available = ds.sizes[depth_dim]
+        ds.close()
         raise ValueError(
-            f"Requested {n_layers} layers, but file only contains {n_available} layers "
-            f"along dimension '{depth_dim}'."
+            f"Requested {n_layers} layers, but only {n_available} are available."
         )
 
-    # Optionally keep only selected variables
-    if variables is not None:
-        missing = [var for var in variables if var not in ds.data_vars]
-        if missing:
-            raise ValueError(
-                f"Variables not found in dataset: {missing}. "
-                f"Available variables are: {list(ds.data_vars)}"
-            )
-
-        # Keep selected variables plus coordinates
-        ds = ds[variables]
-
-    # Optionally select one time step
     if time_index is not None:
-        possible_time_dims = ["time", "time_counter", "t"]
-        time_dims = [dim for dim in possible_time_dims if dim in ds.dims]
+        time_candidates = ["time", "time_counter", "t"]
+        time_matches = [dim for dim in time_candidates if dim in ds.dims]
 
-        if len(time_dims) == 0:
-            raise ValueError(
-                f"time_index was provided, but no time dimension was found. "
-                f"Available dimensions are: {list(ds.dims)}"
-            )
+        if time_matches:
+            ds = ds.isel({time_matches[0]: time_index})
 
-        time_dim = time_dims[0]
-        ds = ds.isel({time_dim: time_index})
+    u = ds[u_var].isel({depth_dim: slice(0, n_layers)})
+    v = ds[v_var].isel({depth_dim: slice(0, n_layers)})
 
-    # Slice vertical layers
-    if from_surface:
-        ds_sliced = ds.isel({depth_dim: slice(0, n_layers)})
-    else:
-        ds_sliced = ds.isel({depth_dim: slice(n_available - n_layers, n_available)})
+    u_y_dim, u_x_dim = infer_horizontal_dims(u, depth_dim)
+    v_y_dim, v_x_dim = infer_horizontal_dims(v, depth_dim)
 
-    # Compression settings
-    encoding = {}
-    for var in ds_sliced.data_vars:
-        if ds_sliced[var].dtype.kind in ["f", "i"]:
-            encoding[var] = {
-                "zlib": True,
-                "complevel": compression_level,
-            }
+    u = u.transpose(depth_dim, u_y_dim, u_x_dim)
+    v = v.transpose(depth_dim, v_y_dim, v_x_dim)
+
+    u_arr = np.nan_to_num(u.values, nan=0.0)
+    v_arr = np.nan_to_num(v.values, nan=0.0)
+
+    u_arr = np.ascontiguousarray(u_arr)
+    v_arr = np.ascontiguousarray(v_arr)
 
     output_nc.parent.mkdir(parents=True, exist_ok=True)
 
-    ds_sliced.to_netcdf(output_nc, encoding=encoding)
+    stem = output_nc.with_suffix("")
+    u_out = stem.parent / f"{stem.name}_uvel.bin"
+    v_out = stem.parent / f"{stem.name}_vvel.bin"
+
+    u_arr.astype(dtype).tofile(u_out)
+    v_arr.astype(dtype).tofile(v_out)
 
     ds.close()
-    ds_sliced.close()
 
-    print(f"Saved sliced file to: {output_nc}")
-    print(f"Kept {n_layers} layers along depth dimension '{depth_dim}'")
+    print(f"Saved u velocity to: {u_out}")
+    print(f"Saved v velocity to: {v_out}")
+    print(f"u shape written: {u_arr.shape} = ({depth_dim}, {u_y_dim}, {u_x_dim})")
+    print(f"v shape written: {v_arr.shape} = ({depth_dim}, {v_y_dim}, {v_x_dim})")
+
+    if dtype == ">f4":
+        print("Use readBinaryPrec = 32 in MITgcm.")
+    elif dtype == ">f8":
+        print("Use readBinaryPrec = 64 in MITgcm.")
 
 
 def calculate_EDS(
