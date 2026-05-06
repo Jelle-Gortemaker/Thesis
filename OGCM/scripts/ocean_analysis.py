@@ -244,6 +244,137 @@ def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean
 
     return output_filename
 
+
+def slice_vertical_layers(
+    input_nc: str,
+    output_nc: str,
+    n_layers: int,
+    depth_dim: str | None = None,
+    from_surface: bool = True,
+    variables: list[str] | None = None,
+    time_index: int | None = None,
+    compression_level: int = 4,
+) -> None:
+    """
+    Slice the upper or lower N vertical layers from a NetCDF file.
+
+    Parameters
+    ----------
+    input_nc : str
+        Path to input NetCDF file.
+    output_nc : str
+        Path to output sliced NetCDF file.
+    n_layers : int
+        Number of vertical layers to keep.
+    depth_dim : str | None
+        Name of the vertical/depth dimension. If None, the function tries to infer it.
+        Common GLORYS names are 'depth', 'deptht', 'lev', 'z', or 'nav_lev'.
+    from_surface : bool
+        If True, keep the first n_layers, assuming depth increases downward.
+        If False, keep the deepest n_layers.
+    variables : list[str] | None
+        Optional list of variables to keep, e.g. ['uo', 'vo', 'thetao', 'so'].
+        If None, all variables are kept.
+    time_index : int | None
+        Optional time index to keep. If None, all time steps are kept.
+    compression_level : int
+        NetCDF compression level from 0 to 9.
+
+    Returns
+    -------
+    None
+        Writes the sliced NetCDF file to output_nc.
+    """
+
+    input_nc = Path(input_nc)
+    output_nc = Path(output_nc)
+
+    if not input_nc.exists():
+        raise FileNotFoundError(f"Input file does not exist: {input_nc}")
+
+    if n_layers < 1:
+        raise ValueError("n_layers must be at least 1.")
+
+    ds = xr.open_dataset(input_nc, chunks="auto")
+
+    # Infer depth dimension if not provided
+    if depth_dim is None:
+        possible_depth_dims = ["depth", "deptht", "depthu", "depthv", "lev", "z", "nav_lev"]
+        matches = [dim for dim in possible_depth_dims if dim in ds.dims]
+
+        if len(matches) == 0:
+            raise ValueError(
+                f"Could not infer depth dimension. Available dimensions are: {list(ds.dims)}. "
+                "Please provide depth_dim explicitly."
+            )
+
+        depth_dim = matches[0]
+
+    if depth_dim not in ds.dims:
+        raise ValueError(
+            f"Depth dimension '{depth_dim}' not found. Available dimensions are: {list(ds.dims)}"
+        )
+
+    n_available = ds.sizes[depth_dim]
+
+    if n_layers > n_available:
+        raise ValueError(
+            f"Requested {n_layers} layers, but file only contains {n_available} layers "
+            f"along dimension '{depth_dim}'."
+        )
+
+    # Optionally keep only selected variables
+    if variables is not None:
+        missing = [var for var in variables if var not in ds.data_vars]
+        if missing:
+            raise ValueError(
+                f"Variables not found in dataset: {missing}. "
+                f"Available variables are: {list(ds.data_vars)}"
+            )
+
+        # Keep selected variables plus coordinates
+        ds = ds[variables]
+
+    # Optionally select one time step
+    if time_index is not None:
+        possible_time_dims = ["time", "time_counter", "t"]
+        time_dims = [dim for dim in possible_time_dims if dim in ds.dims]
+
+        if len(time_dims) == 0:
+            raise ValueError(
+                f"time_index was provided, but no time dimension was found. "
+                f"Available dimensions are: {list(ds.dims)}"
+            )
+
+        time_dim = time_dims[0]
+        ds = ds.isel({time_dim: time_index})
+
+    # Slice vertical layers
+    if from_surface:
+        ds_sliced = ds.isel({depth_dim: slice(0, n_layers)})
+    else:
+        ds_sliced = ds.isel({depth_dim: slice(n_available - n_layers, n_available)})
+
+    # Compression settings
+    encoding = {}
+    for var in ds_sliced.data_vars:
+        if ds_sliced[var].dtype.kind in ["f", "i"]:
+            encoding[var] = {
+                "zlib": True,
+                "complevel": compression_level,
+            }
+
+    output_nc.parent.mkdir(parents=True, exist_ok=True)
+
+    ds_sliced.to_netcdf(output_nc, encoding=encoding)
+
+    ds.close()
+    ds_sliced.close()
+
+    print(f"Saved sliced file to: {output_nc}")
+    print(f"Kept {n_layers} layers along depth dimension '{depth_dim}'")
+
+
 def calculate_EDS(
     filepath,
     target_box=None,
