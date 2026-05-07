@@ -246,31 +246,27 @@ def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean
     return output_filename
 
 
-def infer_horizontal_dims(da, depth_dim):
-    """
-    Infer y and x dimensions from a DataArray.
-    Assumes remaining spatial dims after removing depth/time are ordered as y, x,
-    or named with y/lat and x/lon.
-    """
+from pathlib import Path
+import numpy as np
+import xarray as xr
 
+
+def infer_horizontal_dims(da, depth_dim):
     ignored_dims = {depth_dim, "time", "time_counter", "t"}
     spatial_dims = [dim for dim in da.dims if dim not in ignored_dims]
 
     if len(spatial_dims) != 2:
         raise ValueError(
             f"Could not infer exactly two horizontal dimensions from {da.name}. "
-            f"DataArray dims are {da.dims}, after ignoring {ignored_dims} got {spatial_dims}."
+            f"DataArray dims are {da.dims}, got horizontal dims {spatial_dims}."
         )
 
-    y_names = ["y", "lat", "latitude", "YC", "y_u", "y_v", "y_t"]
-    x_names = ["x", "lon", "longitude", "XC", "x_u", "x_v", "x_t"]
-
     y_dim = next(
-        (dim for dim in spatial_dims if dim in y_names or dim.lower().startswith("y")),
+        (dim for dim in spatial_dims if dim.lower().startswith("y") or "lat" in dim.lower()),
         None,
     )
     x_dim = next(
-        (dim for dim in spatial_dims if dim in x_names or dim.lower().startswith("x")),
+        (dim for dim in spatial_dims if dim.lower().startswith("x") or "lon" in dim.lower()),
         None,
     )
 
@@ -280,37 +276,106 @@ def infer_horizontal_dims(da, depth_dim):
     return y_dim, x_dim
 
 
-def slice_vertical_layers(
+def get_vertical_edges_from_centers(z):
+    z = np.asarray(z, dtype=float)
+
+    if np.any(np.diff(z) <= 0):
+        raise ValueError("Depth coordinate must increase downward.")
+
+    edges = np.zeros(len(z) + 1)
+    edges[1:-1] = 0.5 * (z[:-1] + z[1:])
+    edges[0] = 0.0
+    edges[-1] = z[-1] + 0.5 * (z[-1] - z[-2])
+
+    return edges
+
+
+def average_in_delR_layers(da, source_edges, delR, depth_dim):
+    delR = np.asarray(delR, dtype=float)
+    target_edges = np.concatenate(([0.0], np.cumsum(delR)))
+
+    averaged_layers = []
+
+    for k in range(len(delR)):
+        top = target_edges[k]
+        bottom = target_edges[k + 1]
+
+        overlap = np.maximum(
+            0.0,
+            np.minimum(source_edges[1:], bottom) - np.maximum(source_edges[:-1], top),
+        )
+
+        if np.sum(overlap) <= 0:
+            raise ValueError(
+                f"No source vertical cells overlap target layer {k + 1}: "
+                f"{top}–{bottom} m."
+            )
+
+        weights = xr.DataArray(
+            overlap,
+            dims=[depth_dim],
+            coords={depth_dim: da[depth_dim]},
+        )
+
+        layer_mean = (da * weights).sum(dim=depth_dim) / weights.sum(dim=depth_dim)
+        averaged_layers.append(layer_mean)
+
+    out = xr.concat(averaged_layers, dim=depth_dim)
+    out = out.assign_coords({depth_dim: 0.5 * (target_edges[:-1] + target_edges[1:])})
+
+    return out
+
+
+def slice_vertical_layers_delR(
     input_nc,
     output_nc,
-    n_layers,
-    depth_dim=None,
+    delR,
+    depth_dim="z",
     variables=None,
     time_index=None,
     dtype=">f4",
+    fill_value=0.0,
+    Nx=None,
+    Ny=None,
 ):
     """
-    Slice the upper n_layers from a NetCDF file and write MITgcm-ready
-    binary velocity files.
+    Average u and v velocities inside user-defined delR layers and write:
+      1. MITgcm-ready u velocity binary
+      2. MITgcm-ready v velocity binary
+      3. NetCDF file with the averaged velocity fields
 
-    output_nc is used as a naming template only.
+    Important:
+    - The NetCDF output preserves the original horizontal dimensions, e.g.
+      u_mit(z, y_u, x_u) and v_mit(z, y_v, x_v).
+    - The binary files are cropped to (Nr, Ny, Nx), because MITgcm initial
+      condition files should not contain the extra staggered boundary point.
 
-    Example:
-        output_nc="../data/MITgcm_interp_256x256_aug2020_surface.nc"
-
-    writes:
-        "../data/MITgcm_interp_256x256_aug2020_surface_uvel.bin"
-        "../data/MITgcm_interp_256x256_aug2020_surface_vvel.bin"
+    Parameters
+    ----------
+    input_nc : str or Path
+        Input NetCDF file.
+    output_nc : str or Path
+        Output NetCDF file. Binary files use the same name stem.
+    delR : list or array
+        Target MITgcm layer thicknesses in metres, from surface downward.
+        Example: [20, 480] or [25, 25, 50, 400].
+    depth_dim : str
+        Name of the source vertical coordinate/dimension.
+    variables : list[str]
+        Velocity variable names. For your file, use ["u_mit", "v_mit"].
+    time_index : int or None
+        Optional time index. Use None if there is no time dimension.
+    dtype : str
+        Binary output dtype. Use ">f4" for readBinaryPrec=32, ">f8" for readBinaryPrec=64.
+    fill_value : float
+        Value used to replace NaNs before writing binary files.
+    Nx, Ny : int or None
+        Target MITgcm tracer-grid size. If None, inferred from the minimum
+        horizontal sizes of u and v after averaging.
     """
 
     input_nc = Path(input_nc)
     output_nc = Path(output_nc)
-
-    if not input_nc.exists():
-        raise FileNotFoundError(f"Input file not found: {input_nc}")
-
-    if n_layers < 1:
-        raise ValueError("n_layers must be at least 1.")
 
     if variables is None:
         variables = ["u_mit", "v_mit"]
@@ -318,29 +383,17 @@ def slice_vertical_layers(
     if len(variables) != 2:
         raise ValueError("variables should contain exactly two names: [u_variable, v_variable].")
 
+    if not input_nc.exists():
+        raise FileNotFoundError(f"Input file not found: {input_nc}")
+
+    delR = np.asarray(delR, dtype=float)
+
+    if np.any(delR <= 0):
+        raise ValueError("All delR values must be positive.")
+
     u_var, v_var = variables
 
     ds = xr.open_dataset(input_nc)
-
-    if u_var not in ds.data_vars or v_var not in ds.data_vars:
-        available = list(ds.data_vars)
-        ds.close()
-        raise ValueError(
-            f"Velocity variables not found. Requested {variables}. "
-            f"Available variables: {available}"
-        )
-
-    if depth_dim is None:
-        depth_candidates = ["z", "depth", "deptht", "depthu", "depthv", "lev", "nav_lev"]
-        matches = [dim for dim in depth_candidates if dim in ds.dims]
-
-        if not matches:
-            ds.close()
-            raise ValueError(
-                f"Could not infer depth dimension. Available dimensions: {list(ds.dims)}"
-            )
-
-        depth_dim = matches[0]
 
     if depth_dim not in ds.dims:
         ds.close()
@@ -348,50 +401,133 @@ def slice_vertical_layers(
             f"Depth dimension '{depth_dim}' not found. Available dimensions: {list(ds.dims)}"
         )
 
-    if n_layers > ds.sizes[depth_dim]:
-        n_available = ds.sizes[depth_dim]
+    if u_var not in ds.data_vars or v_var not in ds.data_vars:
+        available = list(ds.data_vars)
         ds.close()
         raise ValueError(
-            f"Requested {n_layers} layers, but only {n_available} are available."
+            f"Velocity variables not found. Requested {variables}. Available: {available}"
         )
 
     if time_index is not None:
-        time_candidates = ["time", "time_counter", "t"]
-        time_matches = [dim for dim in time_candidates if dim in ds.dims]
+        for possible_time_dim in ["time", "time_counter", "t"]:
+            if possible_time_dim in ds.dims:
+                ds = ds.isel({possible_time_dim: time_index})
+                break
 
-        if time_matches:
-            ds = ds.isel({time_matches[0]: time_index})
+    z = ds[depth_dim].values
+    source_edges = get_vertical_edges_from_centers(z)
 
-    u = ds[u_var].isel({depth_dim: slice(0, n_layers)})
-    v = ds[v_var].isel({depth_dim: slice(0, n_layers)})
+    max_requested_depth = np.sum(delR)
 
-    u_y_dim, u_x_dim = infer_horizontal_dims(u, depth_dim)
-    v_y_dim, v_x_dim = infer_horizontal_dims(v, depth_dim)
+    if max_requested_depth > source_edges[-1]:
+        ds.close()
+        raise ValueError(
+            f"Requested total depth {max_requested_depth:.2f} m, but source data only reaches "
+            f"approximately {source_edges[-1]:.2f} m."
+        )
 
-    u = u.transpose(depth_dim, u_y_dim, u_x_dim)
-    v = v.transpose(depth_dim, v_y_dim, v_x_dim)
+    u = ds[u_var]
+    v = ds[v_var]
 
-    u_arr = np.nan_to_num(u.values, nan=0.0)
-    v_arr = np.nan_to_num(v.values, nan=0.0)
+    u_avg = average_in_delR_layers(u, source_edges, delR, depth_dim)
+    v_avg = average_in_delR_layers(v, source_edges, delR, depth_dim)
 
-    u_arr = np.ascontiguousarray(u_arr)
-    v_arr = np.ascontiguousarray(v_arr)
+    u_y_dim, u_x_dim = infer_horizontal_dims(u_avg, depth_dim)
+    v_y_dim, v_x_dim = infer_horizontal_dims(v_avg, depth_dim)
+
+    u_out_da = u_avg.transpose(depth_dim, u_y_dim, u_x_dim)
+    v_out_da = v_avg.transpose(depth_dim, v_y_dim, v_x_dim)
+
+    u_arr_full = np.nan_to_num(u_out_da.values, nan=fill_value)
+    v_arr_full = np.nan_to_num(v_out_da.values, nan=fill_value)
+
+    u_arr_full = np.ascontiguousarray(u_arr_full)
+    v_arr_full = np.ascontiguousarray(v_arr_full)
+
+    Nr = len(delR)
+
+    # Infer MITgcm binary target size.
+    # For staggered data:
+    #   u might be (Nr, Ny, Nx+1)
+    #   v might be (Nr, Ny+1, Nx)
+    # The MITgcm init binaries should be cropped to (Nr, Ny, Nx).
+    if Ny is None:
+        Ny = min(u_arr_full.shape[1], v_arr_full.shape[1])
+
+    if Nx is None:
+        Nx = min(u_arr_full.shape[2], v_arr_full.shape[2])
+
+    u_arr_bin = u_arr_full[:, :Ny, :Nx]
+    v_arr_bin = v_arr_full[:, :Ny, :Nx]
+
+    expected_shape = (Nr, Ny, Nx)
+
+    if u_arr_bin.shape != expected_shape:
+        ds.close()
+        raise ValueError(
+            f"Unexpected u binary shape after cropping: {u_arr_bin.shape}. "
+            f"Expected {expected_shape}."
+        )
+
+    if v_arr_bin.shape != expected_shape:
+        ds.close()
+        raise ValueError(
+            f"Unexpected v binary shape after cropping: {v_arr_bin.shape}. "
+            f"Expected {expected_shape}."
+        )
 
     output_nc.parent.mkdir(parents=True, exist_ok=True)
 
     stem = output_nc.with_suffix("")
-    u_out = stem.parent / f"{stem.name}_uvel.bin"
-    v_out = stem.parent / f"{stem.name}_vvel.bin"
+    u_bin = stem.parent / f"{stem.name}_uvel.bin"
+    v_bin = stem.parent / f"{stem.name}_vvel.bin"
 
-    u_arr.astype(dtype).tofile(u_out)
-    v_arr.astype(dtype).tofile(v_out)
+    u_arr_bin.astype(dtype).tofile(u_bin)
+    v_arr_bin.astype(dtype).tofile(v_bin)
+
+    ds_out = xr.Dataset(
+        {
+            f"{u_var}_delRavg": u_out_da,
+            f"{v_var}_delRavg": v_out_da,
+        }
+    )
+
+    ds_out = ds_out.assign_coords(
+        {
+            "delR": (depth_dim, delR),
+            "layer_top": (depth_dim, np.concatenate(([0.0], np.cumsum(delR)[:-1]))),
+            "layer_bottom": (depth_dim, np.cumsum(delR)),
+        }
+    )
+
+    ds_out.attrs["description"] = "Velocity averaged over user-defined delR layers."
+    ds_out.attrs["source_file"] = str(input_nc)
+    ds_out.attrs["binary_dtype"] = dtype
+    ds_out.attrs["binary_Nr"] = int(Nr)
+    ds_out.attrs["binary_Ny"] = int(Ny)
+    ds_out.attrs["binary_Nx"] = int(Nx)
+    ds_out.attrs["note"] = (
+        "NetCDF preserves original horizontal dimensions. "
+        "Binary velocity files are cropped to (Nr, Ny, Nx)."
+    )
+
+    ds_out.to_netcdf(output_nc)
 
     ds.close()
+    ds_out.close()
 
-    print(f"Saved u velocity to: {u_out}")
-    print(f"Saved v velocity to: {v_out}")
-    print(f"u shape written: {u_arr.shape} = ({depth_dim}, {u_y_dim}, {u_x_dim})")
-    print(f"v shape written: {v_arr.shape} = ({depth_dim}, {v_y_dim}, {v_x_dim})")
+    print(f"Saved NetCDF to: {output_nc}")
+    print(f"Saved u velocity to: {u_bin}")
+    print(f"Saved v velocity to: {v_bin}")
+    print(f"delR: {delR.tolist()}")
+    print()
+    print("NetCDF shapes:")
+    print(f"  u full shape: {u_arr_full.shape} = ({depth_dim}, {u_y_dim}, {u_x_dim})")
+    print(f"  v full shape: {v_arr_full.shape} = ({depth_dim}, {v_y_dim}, {v_x_dim})")
+    print()
+    print("MITgcm binary shapes:")
+    print(f"  u binary shape written: {u_arr_bin.shape}")
+    print(f"  v binary shape written: {v_arr_bin.shape}")
 
     if dtype == ">f4":
         print("Use readBinaryPrec = 32 in MITgcm.")
