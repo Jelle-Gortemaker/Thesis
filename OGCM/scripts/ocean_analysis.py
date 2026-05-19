@@ -535,6 +535,86 @@ def slice_vertical_layers_delR(
         print("Use readBinaryPrec = 64 in MITgcm.")
 
 
+def spinup_to_baro1_bin(input_nc, output_file, dtype=">f4"):
+    """
+    Read top-layer UVEL and VVEL from an MITgcm NetCDF output file and write
+    MITgcm-ready binary files.
+
+    output_file is used as naming template.
+
+    Example:
+        output_file = "../data/processed/MITgcm_spinup_256x256_jan2020_1layer.nc"
+
+    writes:
+        ../data/processed/MITgcm_spinup_256x256_jan2020_1layer_uvel.bin
+        ../data/processed/MITgcm_spinup_256x256_jan2020_1layer_vvel.bin
+    """
+
+    input_nc = Path(input_nc)
+    output_file = Path(output_file)
+
+    ds = xr.open_dataset(input_nc)
+
+    # Select last time step if time dimension exists
+    u = ds["UVEL"]
+    v = ds["VVEL"]
+
+    if "T" in u.dims:
+        u = u.isel(T=-1)
+    if "T" in v.dims:
+        v = v.isel(T=-1)
+
+    # Select top vertical layer
+    # In your file UVEL dims: (T, Zmd000002, Y, Xp1)
+    # VVEL dims: (T, Zmd000002, Yp1, X)
+    z_u = [d for d in u.dims if d.startswith("Z")]
+    z_v = [d for d in v.dims if d.startswith("Z")]
+
+    if z_u:
+        u = u.isel({z_u[0]: 0})
+    if z_v:
+        v = v.isel({z_v[0]: 0})
+
+    # Crop staggered grids to tracer size:
+    # UVEL: Y x Xp1 -> Y x X
+    # VVEL: Yp1 x X -> Y x X
+    Nx = ds.attrs.get("Nx", None)
+    Ny = ds.attrs.get("Ny", None)
+
+    if Nx is None:
+        Nx = ds.sizes["X"] if "X" in ds.sizes else min(u.shape[-1], v.shape[-1])
+    if Ny is None:
+        Ny = ds.sizes["Y"] if "Y" in ds.sizes else min(u.shape[-2], v.shape[-2])
+
+    u_arr = np.nan_to_num(u.values, nan=0.0)[:Ny, :Nx]
+    v_arr = np.nan_to_num(v.values, nan=0.0)[:Ny, :Nx]
+
+    # Add vertical dimension back: (Nr, Ny, Nx), with Nr=1
+    u_arr = u_arr[np.newaxis, :, :]
+    v_arr = v_arr[np.newaxis, :, :]
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    stem = output_file.with_suffix("")
+    u_bin = stem.parent / f"{stem.name}_uvel.bin"
+    v_bin = stem.parent / f"{stem.name}_vvel.bin"
+
+    np.ascontiguousarray(u_arr).astype(dtype).tofile(u_bin)
+    np.ascontiguousarray(v_arr).astype(dtype).tofile(v_bin)
+
+    ds.close()
+
+    print(f"Saved u velocity to: {u_bin}")
+    print(f"Saved v velocity to: {v_bin}")
+    print(f"u shape written: {u_arr.shape}")
+    print(f"v shape written: {v_arr.shape}")
+
+    if dtype == ">f4":
+        print("Use readBinaryPrec = 32 in MITgcm.")
+    elif dtype == ">f8":
+        print("Use readBinaryPrec = 64 in MITgcm.")
+
+
 def calculate_EDS(
     filepath,
     target_box=None,
