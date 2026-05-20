@@ -1127,13 +1127,35 @@ def plot_eds_overview(
     axr.grid(alpha=0.35)
     axr.set_title(f"C. Angular energy distribution integrated over ({rose_label}) length scales", va="bottom", pad=14)
 
-    fig.suptitle(title, fontsize=15, y=1.04)
+    layer_label = ""
+    if "layer_index" in eds.attrs:
+        layer_label = f"Layer {eds.attrs['layer_index']}"
+    title_parts = [title]
+
+    if coord_label != "":
+        title_parts.append(coord_label)
+
+    if layer_label != "":
+        title_parts.append(layer_label)
+
+    fig.suptitle("\n".join(title_parts), fontsize=15, y=1.04)
     plt.show()
 
 
-def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=None, y_res=None,
-                       n_bins=8, remove_mean=True, min_modes_per_bin=3, rose_scale_bands_km=None,
-                       rose_n_angle_bins=12, snapshot_index=None):
+def calculate_EDS_init(
+    filepath,
+    target_box=None,
+    max_wavelength_km=None,
+    x_res=None,
+    y_res=None,
+    n_bins=8,
+    remove_mean=True,
+    min_modes_per_bin=3,
+    rose_scale_bands_km=None,
+    rose_n_angle_bins=12,
+    snapshot_index=None,
+    layer_index=0,
+):
     ds = xr.open_dataset(filepath)
     print(ds)
 
@@ -1150,16 +1172,27 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
     # Check what depth dimension is used
     print(f"Depth dimension: {depth_dim}")
 
-    # Select the surface layer (depth=0)
+    # Validate requested vertical layer
+    n_layers = ds.sizes[depth_dim]
+    if layer_index < 0 or layer_index >= n_layers:
+        raise IndexError(
+            f"layer_index={layer_index} is outside the available range 0..{n_layers - 1}"
+        )
+
+    print(f"Selected layer index: {layer_index}")
+
+    # Select requested vertical layer
     if target_box is None:
-        box_ds = ds.isel({depth_dim: 0})
+        box_ds = ds.isel({depth_dim: layer_index})
     else:
         x_coord = 'X' if 'X' in ds.coords else 'x'
         y_coord = 'Y' if 'Y' in ds.coords else 'y'
         box_ds = ds.sel(
-            **{x_coord: slice(target_box[0], target_box[1]),
-               y_coord: slice(target_box[2], target_box[3])}
-        ).isel({depth_dim: 0})
+            **{
+                x_coord: slice(target_box[0], target_box[1]),
+                y_coord: slice(target_box[2], target_box[3]),
+            }
+        ).isel({depth_dim: layer_index})
 
     box_ds['UVEL'] = box_ds['UVEL'].interp(Xp1=box_ds['X'])
     box_ds['VVEL'] = box_ds['VVEL'].interp(Yp1=box_ds['Y'])
@@ -1249,7 +1282,9 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
     n_time = len(box_ds[time_coord])
     if snapshot_index is not None:
         if snapshot_index < 0 or snapshot_index >= n_time:
-            raise IndexError(f"snapshot_index={snapshot_index} is outside the available time range 0..{n_time - 1}")
+            raise IndexError(
+                f"snapshot_index={snapshot_index} is outside the available time range 0..{n_time - 1}"
+            )
         selected_time_indices = [snapshot_index]
     else:
         selected_time_indices = np.arange(n_time)
@@ -1309,7 +1344,9 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
 
                 vals = np.zeros(rose_n_angle_bins, dtype=float)
                 for j in range(rose_n_angle_bins):
-                    m = (band_theta >= rose_angle_edges_deg[j]) & (band_theta < rose_angle_edges_deg[j + 1])
+                    m = (band_theta >= rose_angle_edges_deg[j]) & (
+                        band_theta < rose_angle_edges_deg[j + 1]
+                    )
                     vals[j] = np.nansum(band_energy[m]) if np.any(m) else 0.0
 
                 rose_band_energy[b, :] = vals
@@ -1319,6 +1356,7 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
     spectra_shell = np.asarray(spectra_shell)
     spectra_density = np.asarray(spectra_density)
     spectra_axis_complex = np.asarray(spectra_axis_complex)
+
     if rose_enabled:
         rose_snapshots = np.asarray(rose_snapshots)
     else:
@@ -1352,6 +1390,7 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
         snapshot_time_value = "all timesteps"
     else:
         snapshot_time_index = int(snapshot_index)
+        snapshot_time_value = box_ds[time_coord].isel(**{time_coord: snapshot_index}).item()
 
     data_vars = {
         "shell_integrated_spectrum": (("wavenumber",), mean_shell),
@@ -1382,6 +1421,9 @@ def calculate_EDS_init(filepath, target_box=None, max_wavelength_km=None, x_res=
             "domain_Lx_km": Lx / 1000.0,
             "domain_Ly_km": Ly / 1000.0,
             "snapshot_time_index": snapshot_time_index,
+            "snapshot_time_value": snapshot_time_value,
+            "layer_index": int(layer_index),
+            "depth_dim": depth_dim,
         },
     ).dropna(dim="wavenumber", how="all")
 
