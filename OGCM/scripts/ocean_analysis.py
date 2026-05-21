@@ -1139,7 +1139,7 @@ def plot_eds_overview(
         title_parts.append(layer_label)
 
     fig.suptitle("\n".join(title_parts), fontsize=15, y=1.04)
-    plt.show()
+    # plt.show()
 
 
 def calculate_EDS_init(
