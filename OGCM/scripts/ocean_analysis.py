@@ -535,15 +535,32 @@ def slice_vertical_layers_delR(
         print("Use readBinaryPrec = 64 in MITgcm.")
 
 
-def spinup_to_baro1_bin(input_nc, output_file, dtype=">f4"):
+def spinup_to_baro1_bin(
+    input_nc,
+    output_file,
+    time_index=None,
+    time_days=None,
+    time_seconds=None,
+    time_dim=None,
+    z_index=0,
+    dtype=">f4",
+):
     """
-    Read top-layer UVEL and VVEL from an MITgcm NetCDF output file and write
-    MITgcm-ready binary files.
+    Read one vertical layer of UVEL and VVEL from an MITgcm NetCDF output file
+    and write MITgcm-ready 1-layer binary files.
 
-    output_file is used as naming template.
+    Time selection priority:
+        1. time_index   : direct integer index
+        2. time_days    : physical model time in days, nearest available output
+        3. time_seconds : physical model time in seconds, nearest available output
+        4. None         : last available timestep
 
-    Example:
-        output_file = "../data/processed/MITgcm_spinup_256x256_jan2020_1layer.nc"
+    Preferred use:
+        spinup_to_baro1_bin(
+            input_nc="spinup_state.nc",
+            output_file="../data/processed/MITgcm_spinup_256x256_jan2020_1layer.nc",
+            time_days=2.0,
+        )
 
     writes:
         ../data/processed/MITgcm_spinup_256x256_jan2020_1layer_uvel.bin
@@ -555,64 +572,195 @@ def spinup_to_baro1_bin(input_nc, output_file, dtype=">f4"):
 
     ds = xr.open_dataset(input_nc)
 
-    # Select last time step if time dimension exists
-    u = ds["UVEL"]
-    v = ds["VVEL"]
+    try:
+        if "UVEL" not in ds:
+            raise KeyError("UVEL not found in input dataset.")
+        if "VVEL" not in ds:
+            raise KeyError("VVEL not found in input dataset.")
 
-    if "T" in u.dims:
-        u = u.isel(T=-1)
-    if "T" in v.dims:
-        v = v.isel(T=-1)
+        u = ds["UVEL"]
+        v = ds["VVEL"]
 
-    # Select top vertical layer
-    # In your file UVEL dims: (T, Zmd000002, Y, Xp1)
-    # VVEL dims: (T, Zmd000002, Yp1, X)
-    z_u = [d for d in u.dims if d.startswith("Z")]
-    z_v = [d for d in v.dims if d.startswith("Z")]
+        # ------------------------------------------------------------
+        # Infer time dimension
+        # ------------------------------------------------------------
+        if time_dim is None:
+            candidate_time_dims = ["T", "time", "Time", "iter"]
+            time_dim = next(
+                (d for d in candidate_time_dims if d in u.dims or d in v.dims),
+                None,
+            )
 
-    if z_u:
-        u = u.isel({z_u[0]: 0})
-    if z_v:
-        v = v.isel({z_v[0]: 0})
+            if time_dim is None:
+                for d in u.dims:
+                    dl = d.lower()
+                    if dl.startswith("t") or "time" in dl:
+                        time_dim = d
+                        break
 
-    # Crop staggered grids to tracer size:
-    # UVEL: Y x Xp1 -> Y x X
-    # VVEL: Yp1 x X -> Y x X
-    Nx = ds.attrs.get("Nx", None)
-    Ny = ds.attrs.get("Ny", None)
+        has_time = time_dim is not None and (time_dim in u.dims or time_dim in v.dims)
 
-    if Nx is None:
-        Nx = ds.sizes["X"] if "X" in ds.sizes else min(u.shape[-1], v.shape[-1])
-    if Ny is None:
-        Ny = ds.sizes["Y"] if "Y" in ds.sizes else min(u.shape[-2], v.shape[-2])
+        # ------------------------------------------------------------
+        # Select timestep
+        # ------------------------------------------------------------
+        selected_time_index = None
+        selected_time_value = None
 
-    u_arr = np.nan_to_num(u.values, nan=0.0)[:Ny, :Nx]
-    v_arr = np.nan_to_num(v.values, nan=0.0)[:Ny, :Nx]
+        if has_time:
+            nt = ds.sizes[time_dim]
 
-    # Add vertical dimension back: (Nr, Ny, Nx), with Nr=1
-    u_arr = u_arr[np.newaxis, :, :]
-    v_arr = v_arr[np.newaxis, :, :]
+            n_time_selectors = sum(
+                x is not None for x in [time_index, time_days, time_seconds]
+            )
+            if n_time_selectors > 1:
+                raise ValueError(
+                    "Choose only one of time_index, time_days, or time_seconds."
+                )
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+            if time_index is not None:
+                selected_time_index = int(time_index)
 
-    stem = output_file.with_suffix("")
-    u_bin = stem.parent / f"{stem.name}_uvel.bin"
-    v_bin = stem.parent / f"{stem.name}_vvel.bin"
+            elif time_days is not None or time_seconds is not None:
+                target_seconds = (
+                    float(time_seconds)
+                    if time_seconds is not None
+                    else float(time_days) * 86400.0
+                )
 
-    np.ascontiguousarray(u_arr).astype(dtype).tofile(u_bin)
-    np.ascontiguousarray(v_arr).astype(dtype).tofile(v_bin)
+                if time_dim not in ds.coords:
+                    raise ValueError(
+                        f"Cannot select by physical time because {time_dim!r} "
+                        "is not available as a coordinate. Use time_index instead."
+                    )
 
-    ds.close()
+                time_values = np.asarray(ds[time_dim].values)
 
-    print(f"Saved u velocity to: {u_bin}")
-    print(f"Saved v velocity to: {v_bin}")
-    print(f"u shape written: {u_arr.shape}")
-    print(f"v shape written: {v_arr.shape}")
+                # Convert datetime64 coordinates to seconds relative to first output.
+                if np.issubdtype(time_values.dtype, np.datetime64):
+                    time_seconds_available = (
+                        time_values - time_values[0]
+                    ) / np.timedelta64(1, "s")
+                    time_seconds_available = time_seconds_available.astype(float)
 
-    if dtype == ">f4":
-        print("Use readBinaryPrec = 32 in MITgcm.")
-    elif dtype == ">f8":
-        print("Use readBinaryPrec = 64 in MITgcm.")
+                else:
+                    time_seconds_available = time_values.astype(float)
+
+                    # Heuristic:
+                    # MITgcm MNC T is often in seconds.
+                    # If values are small and user asks by days, they may already be in days.
+                    if np.nanmax(np.abs(time_seconds_available)) < 1000.0 and time_days is not None:
+                        time_seconds_available = time_seconds_available * 86400.0
+
+                selected_time_index = int(
+                    np.nanargmin(np.abs(time_seconds_available - target_seconds))
+                )
+
+                selected_time_value = float(time_seconds_available[selected_time_index])
+
+            else:
+                selected_time_index = nt - 1
+
+            if selected_time_index < 0:
+                selected_time_index = nt + selected_time_index
+
+            if selected_time_index < 0 or selected_time_index >= nt:
+                raise IndexError(
+                    f"time_index={selected_time_index} out of range for "
+                    f"{time_dim}, nt={nt}"
+                )
+
+            if time_dim in u.dims:
+                u = u.isel({time_dim: selected_time_index})
+            if time_dim in v.dims:
+                v = v.isel({time_dim: selected_time_index})
+
+        else:
+            if any(x is not None for x in [time_index, time_days, time_seconds]):
+                raise ValueError(
+                    "A time selector was provided, but no time dimension was found."
+                )
+
+        # ------------------------------------------------------------
+        # Select vertical layer
+        # ------------------------------------------------------------
+        z_u = [d for d in u.dims if d.startswith("Z") or d.lower().startswith("z")]
+        z_v = [d for d in v.dims if d.startswith("Z") or d.lower().startswith("z")]
+
+        if z_u:
+            nz_u = u.sizes[z_u[0]]
+            if z_index < 0 or z_index >= nz_u:
+                raise IndexError(f"z_index={z_index} out of range for UVEL; nz={nz_u}")
+            u = u.isel({z_u[0]: z_index})
+
+        if z_v:
+            nz_v = v.sizes[z_v[0]]
+            if z_index < 0 or z_index >= nz_v:
+                raise IndexError(f"z_index={z_index} out of range for VVEL; nz={nz_v}")
+            v = v.isel({z_v[0]: z_index})
+
+        # ------------------------------------------------------------
+        # Crop staggered grids to tracer size
+        # UVEL: Y x Xp1 -> Y x X
+        # VVEL: Yp1 x X -> Y x X
+        # ------------------------------------------------------------
+        Nx = ds.attrs.get("Nx", None)
+        Ny = ds.attrs.get("Ny", None)
+
+        if Nx is None:
+            Nx = ds.sizes["X"] if "X" in ds.sizes else min(u.shape[-1], v.shape[-1])
+        if Ny is None:
+            Ny = ds.sizes["Y"] if "Y" in ds.sizes else min(u.shape[-2], v.shape[-2])
+
+        Nx = int(Nx)
+        Ny = int(Ny)
+
+        u_arr = np.nan_to_num(u.values, nan=0.0)[:Ny, :Nx]
+        v_arr = np.nan_to_num(v.values, nan=0.0)[:Ny, :Nx]
+
+        # Add vertical dimension back: (Nr, Ny, Nx), with Nr=1
+        u_arr = u_arr[np.newaxis, :, :]
+        v_arr = v_arr[np.newaxis, :, :]
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        stem = output_file.with_suffix("")
+        u_bin = stem.parent / f"{stem.name}_uvel.bin"
+        v_bin = stem.parent / f"{stem.name}_vvel.bin"
+
+        np.ascontiguousarray(u_arr).astype(dtype).tofile(u_bin)
+        np.ascontiguousarray(v_arr).astype(dtype).tofile(v_bin)
+
+        print(f"Saved u velocity to: {u_bin}")
+        print(f"Saved v velocity to: {v_bin}")
+        print(f"u shape written: {u_arr.shape}")
+        print(f"v shape written: {v_arr.shape}")
+
+        if has_time:
+            print(f"Selected time dimension: {time_dim}")
+            print(f"Selected time index    : {selected_time_index}")
+            if selected_time_value is not None:
+                print(f"Selected model time    : {selected_time_value:.1f} s = {selected_time_value / 86400.0:.4f} days")
+
+        print(f"Selected vertical index: {z_index}")
+
+        if dtype == ">f4":
+            print("Use readBinaryPrec = 32 in MITgcm.")
+        elif dtype == ">f8":
+            print("Use readBinaryPrec = 64 in MITgcm.")
+
+        return {
+            "u_bin": u_bin,
+            "v_bin": v_bin,
+            "u_shape": u_arr.shape,
+            "v_shape": v_arr.shape,
+            "time_dim": time_dim,
+            "time_index": selected_time_index,
+            "time_seconds": selected_time_value,
+            "z_index": z_index,
+        }
+
+    finally:
+        ds.close()
 
 
 def calculate_EDS(
