@@ -7,11 +7,11 @@ from typing import Literal, Optional
 
 import numpy as np
 import xarray as xr
-from parcels import ParticleSet, AdvectionRK4
+from parcels import ParticleSet
 
 from .fieldset import build_fieldset
-from .particles import SurfaceParticle, DepthParticle
-from .kernels import age_particle, periodic_xy
+from .particles import FloatingParticle
+from .kernels import advection_passive_or_inertial, periodic_xy
 from .io_utils import ensure_dir, open_trajectory_dataset
 
 
@@ -20,37 +20,36 @@ class RunConfig:
     input_nc: str
     output_path: str
 
-    # Simulation timing
     runtime_days: float = 14.0
     dt_seconds: int = 300
-    outputdt_seconds: int = 10800          # 3 hours
-    time_step_seconds: int = 10800         # MITgcm velocity output frequency
-    release_time_index: int = 0            # change this for T=0, T=10, ...
+    outputdt_seconds: int = 10800
 
-    # Field / particle setup
+    time_step_seconds: int = 10800
+    release_time_index: int = 0
+
     surface_only: bool = True
     mesh: str = "flat"
     periodic: bool = True
     level_indices: tuple[int, ...] = (0,)
 
-    # Release setup
     release_mode: Literal["grid", "random"] = "grid"
     nx: int = 50
     ny: int = 50
     n_particles: int = 2500
     seed: int = 42
 
-    # Optional release bounds
     xmin: Optional[float] = None
     xmax: Optional[float] = None
     ymin: Optional[float] = None
     ymax: Optional[float] = None
 
-    # Keep particles away from exact boundaries
     release_margin_cells: float = 1.0
 
-    # Only used for true 3D tracking
-    depth_value: Optional[float] = None
+    # Particle class for this run
+    particle_class: Literal["passive", "inertial"] = "passive"
+    tau_p_seconds: float = 0.0
+    flow_timescale_seconds: Optional[float] = None
+    initial_particle_velocity: Literal["fluid", "zero"] = "fluid"
 
 
 def _grid_spacing_1d(a: np.ndarray) -> float:
@@ -122,29 +121,75 @@ def _get_release_time(fieldset, release_time_index: int) -> float:
 
 
 def _check_runtime_available(fieldset, release_time: float, runtime_seconds: float) -> None:
-    last_time = float(np.asarray(fieldset.U.grid.time, dtype=float)[-1])
+    times = np.asarray(fieldset.U.grid.time, dtype=float)
+    last_time = float(times[-1])
     requested_end = release_time + runtime_seconds
 
     if requested_end > last_time:
         available_days = (last_time - release_time) / 86400.0
         requested_days = runtime_seconds / 86400.0
         raise ValueError(
-            f"Requested runtime is too long for the available velocity forcing.\n"
+            "Requested runtime is too long for the available velocity forcing.\n"
             f"Requested: {requested_days:.2f} days after release.\n"
             f"Available: {available_days:.2f} days after release.\n"
-            f"Reduce runtime_days or choose an earlier release_time_index."
+            "Reduce runtime_days or choose an earlier release_time_index."
         )
+
+
+def _sample_initial_fluid_velocity(
+    ds: xr.Dataset,
+    lon0: np.ndarray,
+    lat0: np.ndarray,
+    release_time_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = xr.DataArray(np.arange(len(lon0)), dims="particle")
+    lon_da = xr.DataArray(lon0, dims="particle", coords={"particle": points})
+    lat_da = xr.DataArray(lat0, dims="particle", coords={"particle": points})
+
+    U0 = ds["U"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
+    V0 = ds["V"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
+
+    U0 = np.asarray(U0, dtype=float)
+    V0 = np.asarray(V0, dtype=float)
+
+    U0 = np.where(np.isfinite(U0), U0, 0.0)
+    V0 = np.where(np.isfinite(V0), V0, 0.0)
+
+    return U0, V0
+
+
+def _particle_class_parameters(config: RunConfig) -> tuple[int, float, float, str]:
+    if config.particle_class == "passive":
+        return 0, 0.0, 0.0, "passive"
+
+    if config.particle_class != "inertial":
+        raise ValueError(f"Unknown particle_class: {config.particle_class}")
+
+    tau_p = float(config.tau_p_seconds)
+    if tau_p <= 0.0:
+        raise ValueError(f"Inertial particles require tau_p_seconds > 0, got {tau_p}")
+
+    if config.flow_timescale_seconds is None:
+        stokes_number = np.nan
+    else:
+        tref = float(config.flow_timescale_seconds)
+        if tref <= 0.0:
+            raise ValueError(f"flow_timescale_seconds must be > 0, got {tref}")
+        stokes_number = tau_p / tref
+
+    label = f"inertial_tau{tau_p:g}s_St{stokes_number:g}"
+    return 1, tau_p, float(stokes_number), label
 
 
 def run_parcels_experiment(config: RunConfig) -> dict:
     fieldset, meta, ds = build_fieldset(
-    config.input_nc,
-    surface_only=config.surface_only,
-    mesh=config.mesh,
-    time_step_seconds=config.time_step_seconds,
-    level_indices=config.level_indices,
-    periodic=config.periodic,
-)
+        config.input_nc,
+        surface_only=config.surface_only,
+        mesh=config.mesh,
+        time_step_seconds=config.time_step_seconds,
+        level_indices=config.level_indices,
+        periodic=config.periodic,
+    )
 
     lon0, lat0 = prepare_release(config, ds)
 
@@ -152,37 +197,40 @@ def run_parcels_experiment(config: RunConfig) -> dict:
     runtime_seconds = float(config.runtime_days) * 86400.0
     _check_runtime_available(fieldset, release_time, runtime_seconds)
 
+    particle_class_id, tau_p, stokes_number, particle_label = _particle_class_parameters(config)
+
+    if config.particle_class == "inertial" and config.initial_particle_velocity == "zero":
+        up0 = np.zeros_like(lon0, dtype=float)
+        vp0 = np.zeros_like(lat0, dtype=float)
+    else:
+        up0, vp0 = _sample_initial_fluid_velocity(
+            ds,
+            lon0,
+            lat0,
+            config.release_time_index,
+        )
+
+    n = len(lon0)
+    release_id = np.arange(n, dtype=np.int32)
+
     output_path = Path(config.output_path)
     ensure_dir(output_path.parent)
 
-    particle_time = np.full(lon0.shape, release_time, dtype=float)
+    pset = ParticleSet.from_list(
+        fieldset=fieldset,
+        pclass=FloatingParticle,
+        lon=lon0,
+        lat=lat0,
+        time=np.full(n, release_time, dtype=float),
+        release_id=release_id,
+        particle_class_id=np.full(n, particle_class_id, dtype=np.int32),
+        tau_p=np.full(n, tau_p, dtype=np.float32),
+        stokes_number=np.full(n, stokes_number, dtype=np.float32),
+        up=up0.astype(np.float32),
+        vp=vp0.astype(np.float32),
+    )
 
-    if meta.is_3d and not config.surface_only:
-        pclass = DepthParticle
-        depth0 = np.full_like(
-            lon0,
-            float(ds["depth"].values[0] if config.depth_value is None else config.depth_value),
-            dtype=float,
-        )
-        pset = ParticleSet.from_list(
-            fieldset=fieldset,
-            pclass=pclass,
-            lon=lon0,
-            lat=lat0,
-            depth=depth0,
-            time=particle_time,
-        )
-    else:
-        pclass = SurfaceParticle
-        pset = ParticleSet.from_list(
-            fieldset=fieldset,
-            pclass=pclass,
-            lon=lon0,
-            lat=lat0,
-            time=particle_time,
-        )
-
-    kernel = AdvectionRK4 + pset.Kernel(age_particle)
+    kernel = pset.Kernel(advection_passive_or_inertial)
 
     if config.periodic:
         kernel += pset.Kernel(periodic_xy)
@@ -202,7 +250,7 @@ def run_parcels_experiment(config: RunConfig) -> dict:
     return {
         "input_nc": str(config.input_nc),
         "output_path": str(output_path),
-        "n_particles": int(len(lon0)),
+        "n_particles": int(n),
         "release_time_index": int(config.release_time_index),
         "release_time_seconds": float(release_time),
         "release_time_days": float(release_time / 86400.0),
@@ -211,9 +259,19 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         "outputdt_seconds": int(config.outputdt_seconds),
         "surface_only": bool(config.surface_only),
         "periodic": bool(config.periodic),
-        "is_3d_input": bool(meta.is_3d),
-        "u_name": meta.u_name,
-        "v_name": meta.v_name,
+        "level_indices": tuple(config.level_indices),
+        "particle_class": config.particle_class,
+        "particle_class_id": int(particle_class_id),
+        "particle_label": particle_label,
+        "tau_p_seconds": float(tau_p),
+        "stokes_number": float(stokes_number),
+        "flow_timescale_seconds": (
+            None if config.flow_timescale_seconds is None
+            else float(config.flow_timescale_seconds)
+        ),
+        "initial_particle_velocity": config.initial_particle_velocity,
+        "u_name": getattr(meta, "u_name", "UVEL"),
+        "v_name": getattr(meta, "v_name", "VVEL"),
     }
 
 
