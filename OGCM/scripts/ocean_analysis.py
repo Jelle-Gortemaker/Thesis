@@ -1286,7 +1286,7 @@ def plot_eds_overview(
     if layer_label != "":
         title_parts.append(layer_label)
 
-    fig.suptitle("\n".join(title_parts), fontsize=15, y=1.04)
+    fig.suptitle("\n".join(title_parts), fontsize=15, y=1.05)
     # plt.show()
 
 
