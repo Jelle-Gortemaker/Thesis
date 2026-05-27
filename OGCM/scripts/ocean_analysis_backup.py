@@ -7,18 +7,6 @@ import cartopy.feature as cfeature
 import os
 import sys
 from pathlib import Path
-import matplotlib.ticker as mticker
-from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
-import theme.plot_theme as ptheme
-
-
-for _parent in Path(__file__).resolve().parents:
-    if (_parent / "theme" / "plot_theme.py").exists():
-        if str(_parent) not in sys.path:
-            sys.path.insert(0, str(_parent))
-        break
-
-import theme.plot_theme as ptheme
 
 def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0, time_range=None):
     """
@@ -107,205 +95,58 @@ def calculate_okubo_weiss(ds_slice):
         'vorticity': ((lat_dim, lon_dim), omega),
     }, coords=ds_slice.coords)
 
+def plot_ocean_field(data, u=None, v=None, title="", cmap='viridis', label="", target_box=None, **kwargs):
+    """Plotting wrapper with explicit ax.text argument naming."""
+    fig = plt.figure(figsize=(10, 7))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.add_feature(cfeature.COASTLINE)
+    ax.add_feature(cfeature.LAND, facecolor='lightgray')
+    ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
 
-def plot_ocean_field(
-    data,
-    u=None,
-    v=None,
-    title="",
-    cmap=None,
-    cmap_category="default",
-    label="",
-    target_box=None,
-    extent=None,
-    lon_ticks=None,
-    lat_ticks=None,
-    vabs=None,
-    **kwargs,
-):
-    """
-    Minimal, robust Cartopy map plot.
+    # Use pop to avoid passing these to the data.plot() function
+    vector_scale = kwargs.pop('vector_scale', 10)
+    skip = kwargs.pop('skip', 5)
 
-    Rules:
-    - white background
-    - x-axis tick labels only on top
-    - y-axis tick labels only on left
-    - fixed map extent
-    - optional fixed symmetric colorbar magnitude via vabs
-    - no Cartopy gridline labels
-    """
-    ptheme.apply_theme()
-
-    if cmap is None:
-        cmap = ptheme.get_cmap(cmap_category)
-
-    if extent is None:
-        extent = [-155, -130, 20, 45]
-
-    if lon_ticks is None:
-        lon_ticks = np.arange(extent[0], extent[1] + 1, 5)
-
-    if lat_ticks is None:
-        lat_ticks = np.arange(extent[2], extent[3] + 1, 5)
-
-    # Pull plotting-only kwargs before making the scalar plot.
-    skip = kwargs.pop("skip", 5)
-    vector_scale = kwargs.pop("vector_scale", 15)
-    kwargs.pop("center", None)
-    kwargs.pop("robust", None)
-
-    vmin = kwargs.pop("vmin", None)
-    vmax = kwargs.pop("vmax", None)
-
-    if vabs is not None:
-        vmin = -float(vabs)
-        vmax = float(vabs)
-
-    lon_name = "longitude" if "longitude" in data.coords else "lon"
-    lat_name = "latitude" if "latitude" in data.coords else "lat"
-
-    da = data.squeeze().transpose(lat_name, lon_name)
-
-    lon = da[lon_name].values
-    lat = da[lat_name].values
-    field = da.values
-
-    fig = plt.figure(figsize=ptheme.get_figsize("wide"), facecolor="white")
-
-    ax = fig.add_axes([0.08, 0.10, 0.72, 0.80], projection=ccrs.PlateCarree())
-    ax.set_facecolor("white")
-    ax.set_extent(extent, crs=ccrs.PlateCarree())
-
-    ax.add_feature(cfeature.COASTLINE, linewidth=ptheme.THIN_LINE_WIDTH)
-    ax.add_feature(cfeature.LAND, facecolor="white", zorder=0)
-
-    im = ax.pcolormesh(
-        lon,
-        lat,
-        field,
-        transform=ccrs.PlateCarree(),
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        shading="auto",
-        **kwargs,
-    )
-
-    cax = fig.add_axes([0.84, 0.10, 0.035, 0.80])
-    cbar = fig.colorbar(im, cax=cax, extend="both")
-    cbar.set_label(label)
-
-    ax.set_xticks(lon_ticks, crs=ccrs.PlateCarree())
-    ax.set_yticks(lat_ticks, crs=ccrs.PlateCarree())
-
-    ax.xaxis.set_major_formatter(LongitudeFormatter())
-    ax.yaxis.set_major_formatter(LatitudeFormatter())
-
-    # Hard enforce: x labels only top, y labels only left.
-    ax.xaxis.set_ticks_position("top")
-    ax.xaxis.set_label_position("top")
-    ax.yaxis.set_ticks_position("left")
-    ax.yaxis.set_label_position("left")
-
-    ax.tick_params(
-        axis="x",
-        which="both",
-        top=True,
-        bottom=False,
-        labeltop=True,
-        labelbottom=False,
-        pad=4,
-    )
-    ax.tick_params(
-        axis="y",
-        which="both",
-        left=True,
-        right=False,
-        labelleft=True,
-        labelright=False,
-        pad=6,
-    )
-
-    ax.grid(
-        True,
-        linewidth=ptheme.MAP_GRIDLINE_LINEWIDTH,
-        linestyle=ptheme.MAP_GRIDLINE_LINESTYLE,
-        alpha=ptheme.MAP_GRIDLINE_ALPHA,
-    )
+    im = data.plot(ax=ax, transform=ccrs.PlateCarree(), cmap=cmap, 
+                   cbar_kwargs={'label': label}, **kwargs)
 
     if u is not None and v is not None:
-        u_lon_name = "longitude" if "longitude" in u.coords else "lon"
-        u_lat_name = "latitude" if "latitude" in u.coords else "lat"
-
-        ax.quiver(
-            u[u_lon_name][::skip],
-            u[u_lat_name][::skip],
-            u[::skip, ::skip],
-            v[::skip, ::skip],
-            color=ptheme.QUIVER_COLOR,
-            alpha=ptheme.QUIVER_ALPHA,
-            width=ptheme.QUIVER_WIDTH,
-            scale=vector_scale,
-            transform=ccrs.PlateCarree(),
-        )
-
+        ax.quiver(u.longitude[::skip], u.latitude[::skip], 
+                  u[::skip, ::skip], v[::skip, ::skip],
+                  color='black', alpha=0.4, scale=vector_scale, transform=ccrs.PlateCarree())
+    
     if target_box is not None:
+        # target_box is [lon_min, lon_max, lat_min, lat_max]
         lon_min, lon_max, lat_min, lat_max = target_box
-
-        rect = patches.Rectangle(
-            (lon_min, lat_min),
-            lon_max - lon_min,
-            lat_max - lat_min,
-            linewidth=ptheme.TARGET_BOX_LINEWIDTH,
-            edgecolor=ptheme.TARGET_BOX_COLOR,
-            facecolor="none",
-            transform=ccrs.PlateCarree(),
-            zorder=10,
-        )
+        
+        # Calculate width and height in degrees for the rectangle patch
+        width = lon_max - lon_min
+        height = lat_max - lat_min
+        
+        rect = patches.Rectangle((lon_min, lat_min), width, height,
+                                 linewidth=3, edgecolor='red', facecolor='none', 
+                                 transform=ccrs.PlateCarree(), zorder=10)
         ax.add_patch(rect)
+        
+        ax.text(x=lon_min, y=lat_max + 0.1, s="Target Box", 
+                color='red', fontweight='bold', transform=ccrs.PlateCarree())
 
-        ax.text(
-            lon_min,
-            lat_max + 0.15,
-            "Target Box",
-            color=ptheme.TARGET_BOX_COLOR,
-            fontsize=ptheme.ANNOTATION_SIZE,
-            fontweight="bold",
-            transform=ccrs.PlateCarree(),
-            zorder=11,
-        )
-
-    ax.set_title(title)
-
-    return fig, ax
+    plt.title(title)
+    plt.show()
 
 
-def plot_eddy_intensity(
-    intensity_data,
-    u=None,
-    v=None,
-    title="",
-    target_box=None,
-    extent=None,
-    vabs=1.6e-5,
-):
-    """
-    Plot eddy-core relative vorticity with fixed symmetric colorbar limits.
-    """
-    if extent is None:
-        extent = [-155, -130, 20, 45]
-
-    return plot_ocean_field(
-        intensity_data,
-        u=u,
-        v=v,
-        title=title,
+def plot_eddy_intensity(intensity_data, u=None, v=None, title="", target_box=None):
+    """Specialized plot for cyclonic vs anticyclonic cores."""
+    plot_ocean_field(
+        intensity_data, 
+        u=u, v=v, 
+        title=title, 
         target_box=target_box,
-        extent=extent,
-        cmap=ptheme.get_cmap("vorticity"),
-        label=r"Relative Vorticity [s$^{-1}$]",
-        vabs=vabs,
-        vector_scale=15,
+        cmap='RdBu_r', 
+        label="Relative Vorticity [s^-1]",
+        center=0,       
+        robust=True,
+        vector_scale=15
     )
 
 def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean=False):
@@ -1210,34 +1051,32 @@ def calculate_EDS(
 
 
 
-
 def plot_eds_overview(
     eds,
     title="Spectrum and anisotropy overview",
     target_box=None,
-    save_path=None,
-    save=False,
-    show=True,
 ):
     """
     Overview figure with:
     - top: shell-integrated spectrum vs characteristic length
     - middle: spectral density vs wavenumber
     - bottom: single rose plot (first / only scale band)
-
-    Uses theme.plot_theme for all sizes, line widths and colors.
     """
+
     if "rose_spectrum_normalized" not in eds:
         raise ValueError("Dataset does not contain rose_spectrum_normalized.")
-
+    
     coord_label = ""
     if target_box is not None:
         lon_w, lon_e, lat_s, lat_n = target_box
         coord_label = (
-            f"{lat_s:.2f}--{lat_n:.2f}$^\\circ$N, "
-            f"{abs(lon_w):.2f}--{abs(lon_e):.2f}$^\\circ$W"
+            f"{lat_s:.2f}–{lat_n:.2f}°N, "
+            f"{abs(lon_w):.2f}–{abs(lon_e):.2f}°W"
         )
 
+    # -----------------------------
+    # Extract data
+    # -----------------------------
     length_km = eds["characteristic_length"].values / 1000.0
 
     E_shell = eds["shell_integrated_spectrum"].values
@@ -1254,57 +1093,83 @@ def plot_eds_overview(
     if rose.shape[0] < 1:
         raise ValueError("No rose scale band found in rose_spectrum_normalized.")
 
+    # Use only the first rose band
     rose_vals = rose[0]
     rose_label = str(rose_labels[0])
 
-    fig = plt.figure(figsize=ptheme.get_figsize("tall"), constrained_layout=True)
+    # -----------------------------
+    # Styling
+    # -----------------------------
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titlesize": 12,
+        "axes.labelsize": 12,
+        "legend.fontsize": 10,
+    })
+
+    fig = plt.figure(figsize=(8.5, 12.5), constrained_layout=True)
     gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.05, 1.2], hspace=0.18)
 
+    # -----------------------------
     # A. Shell-integrated spectrum
+    # -----------------------------
     ax1 = fig.add_subplot(gs[0, 0])
+
     valid1 = np.isfinite(length_km) & np.isfinite(E_shell) & (length_km > 0) & (E_shell > 0)
 
     ax1.loglog(
         length_km[valid1],
         E_shell[valid1],
         "-o",
-        lw=ptheme.THICK_LINE_WIDTH,
-        ms=ptheme.MARKER_SIZE,
-        color=ptheme.get_color("spectrum_shell"),
+        lw=2.0,
+        ms=5,
+        color="tab:blue",
         label="Shell-integrated KE",
     )
 
-    shell_band_handle = None
     if np.any(np.isfinite(E_shell_std[valid1])):
         lo = np.maximum(E_shell[valid1] - E_shell_std[valid1], 1e-30)
         hi = E_shell[valid1] + E_shell_std[valid1]
-        shell_band_handle = ax1.fill_between(
+        ax1.fill_between(
             length_km[valid1],
             lo,
             hi,
-            color=ptheme.get_color("std_band_shell"),
-            alpha=ptheme.BAND_ALPHA,
+            color="tab:blue",
+            alpha=0.15,
             linewidth=0,
-            label=r"$\\pm 1$ std. dev.",
         )
 
-    ax1.set_xlabel("Characteristic length [km]")
-    ax1.set_ylabel(r"Shell contribution to mean KE [m$^2$ s$^{-2}$]")
+    ax1.set_xlabel("Characteristic length (km)")
+    ax1.set_ylabel(r"Shell contribution to mean KE (m$^2$ s$^{-2}$)")
     ax1.set_title("A. Shell-integrated spectrum", pad=14)
-    ax1.grid(True, which="both", alpha=ptheme.GRID_ALPHA)
-    ax1.legend(loc="upper right", frameon=True)
+    ax1.grid(True, which="both", alpha=0.22)
+    ax1.legend(
+    handles=[
+        ax1.lines[0],
+        patches.Patch(facecolor="tab:blue", alpha=0.15, edgecolor="none"),
+    ],
+    labels=[
+        "Shell-integrated KE",
+        r"$\pm 1$ std. dev.",
+    ],
+    loc="upper right",
+    frameon=True,
+    )
 
+    # -----------------------------
     # B. Spectral density
+    # -----------------------------
     ax2 = fig.add_subplot(gs[1, 0])
+
     valid2 = np.isfinite(k) & np.isfinite(E_k) & (k > 0) & (E_k > 0)
 
     ax2.loglog(
         k[valid2],
         E_k[valid2],
         "-o",
-        lw=ptheme.THICK_LINE_WIDTH,
-        ms=ptheme.MARKER_SIZE,
-        color=ptheme.get_color("spectrum_density"),
+        lw=2.0,
+        ms=5,
+        color="tab:orange",
         label="Spectral density",
     )
 
@@ -1315,10 +1180,9 @@ def plot_eds_overview(
             k[valid2],
             lo,
             hi,
-            color=ptheme.get_color("std_band_density"),
-            alpha=ptheme.BAND_ALPHA,
+            color="tab:orange",
+            alpha=0.15,
             linewidth=0,
-            label=r"$\\pm 1$ std. dev.",
         )
 
     if np.sum(valid2) >= 3:
@@ -1333,32 +1197,48 @@ def plot_eds_overview(
         y_53 = E0 * (k_ref / k0) ** (-5 / 3)
         y_3 = E0 * (k_ref / k0) ** (-3)
 
-        ax2.loglog(
-            k_ref,
-            y_53,
-            "--",
-            color=ptheme.get_color("reference"),
-            lw=ptheme.LINE_WIDTH,
-            alpha=ptheme.REFERENCE_ALPHA,
-            label=r"$k^{-5/3}$",
-        )
-        ax2.loglog(
-            k_ref,
-            y_3,
-            "--",
-            color=ptheme.get_color("highlight"),
-            lw=ptheme.LINE_WIDTH,
-            alpha=ptheme.REFERENCE_ALPHA,
-            label=r"$k^{-3}$",
-        )
+        ax2.loglog(k_ref, y_53, "--", color="0.45", lw=1.8, alpha=0.9, label=r"$k^{-5/3}$")
+        ax2.loglog(k_ref, y_3, "--", color="royalblue", lw=1.8, alpha=0.9, label=r"$k^{-3}$")
 
-    ax2.set_xlabel(r"Wavenumber $k$ [cycles m$^{-1}$]")
-    ax2.set_ylabel(r"Spectral density [(m$^2$ s$^{-2}$)/(cycles m$^{-1}$)]")
+    ax2.set_xlabel(r"Wavenumber $k$ (cycles m$^{-1}$)")
+    ax2.set_ylabel(r"Spectral density ((m$^2$ s$^{-2}$)/(cycles m$^{-1}$))")
     ax2.set_title("B. Spectral density", pad=8)
-    ax2.grid(True, which="both", alpha=ptheme.GRID_ALPHA)
-    ax2.legend(loc="upper right", frameon=True)
+    ax2.grid(True, which="both", alpha=0.22)
+    ax2.legend(
+    handles=[
+        ax2.lines[0],
+        patches.Patch(facecolor="tab:orange", alpha=0.15, edgecolor="none", label=r"$\pm 1$ std. dev."),
+        ax2.lines[1],
+        ax2.lines[2],
+    ],
+    loc="upper right",
+    frameon=True,
+    )
+    
+    legend_handles = [
+    ax2.lines[0],
+    patches.Patch(facecolor="tab:orange", alpha=0.15, edgecolor="none"),
+    ]
+    legend_labels = [
+        "Spectral density",
+        r"$\pm 1$ std. dev.",
+    ]
 
-    # C. Rose plot
+    if len(ax2.lines) > 1:
+        legend_handles.extend(ax2.lines[1:])
+        legend_labels.extend([line.get_label() for line in ax2.lines[1:]])
+
+    ax2.legend(
+        handles=legend_handles,
+        labels=legend_labels,
+        loc="upper right",
+        frameon=True,
+    )
+
+
+    # -----------------------------
+    # C. Single rose plot
+    # -----------------------------
     axr = fig.add_subplot(gs[2, 0], projection="polar")
     axr.set_anchor("C")
 
@@ -1371,9 +1251,9 @@ def plot_eds_overview(
         vals,
         width=dtheta,
         align="center",
-        color=ptheme.get_color("spectrum_shell"),
+        color="tab:blue",
         edgecolor="white",
-        linewidth=ptheme.THIN_LINE_WIDTH,
+        linewidth=0.8,
         alpha=0.9,
     )
 
@@ -1386,35 +1266,29 @@ def plot_eds_overview(
 
     axr.set_ylim(0, vmax * 1.1)
 
+    # sparse radial labels
     rticks = np.linspace(0, vmax, 5)[1:]
     axr.set_rticks(rticks)
     axr.set_yticklabels([f"{r:.2f}" for r in rticks])
     axr.set_rlabel_position(135)
-    axr.grid(alpha=ptheme.GRID_ALPHA)
-    axr.set_title(
-        f"C. Angular energy distribution integrated over ({rose_label}) length scales",
-        va="bottom",
-        pad=14,
-    )
+
+    axr.grid(alpha=0.35)
+    axr.set_title(f"C. Angular energy distribution integrated over ({rose_label}) length scales", va="bottom", pad=14)
 
     layer_label = ""
     if "layer_index" in eds.attrs:
         layer_label = f"Layer {eds.attrs['layer_index']}"
-
     title_parts = [title]
+
     if coord_label != "":
         title_parts.append(coord_label)
+
     if layer_label != "":
         title_parts.append(layer_label)
 
-    fig.suptitle("\n".join(title_parts), fontsize=ptheme.TITLE_SIZE, y=1.05)
+    fig.suptitle("\n".join(title_parts), fontsize=15, y=1.05)
+    # plt.show()
 
-    ptheme.save_figure(fig, save_path, save=save) if save_path is not None else None
-
-    if show:
-        plt.show()
-
-    return fig
 
 def calculate_EDS_init(
     filepath,
@@ -1703,7 +1577,6 @@ def calculate_EDS_init(
 
 
 
-
 def plot_EDS_seasonal(
     data_groups,
     target_box,
@@ -1715,38 +1588,51 @@ def plot_EDS_seasonal(
     temporal_skip_days=0,
     temporal_stride_days=1,
     min_modes_per_bin=3,
-    spectrum_var="shell_integrated_spectrum",
+    spectrum_var="shell_integrated_spectrum",  # or "spectral_density"
     base_colors=None,
     title="Seasonal energy spectrum comparison",
     xlim_km=None,
-    save_path=None,
-    save=False,
-    show=True,
 ):
     """
-    Plot seasonal / yearly comparison of EDS using the shared plotting theme.
+    Plot seasonal / yearly comparison of EDS using the current calculate_EDS method.
+
+    Parameters
+    ----------
+    data_groups : dict
+        Example:
+        {
+            "Winter": {"2020": "...", "2021": "..."},
+            "Summer": {"2020": "...", "2021": "..."},
+        }
+    target_box : list
+        [lon_min, lon_max, lat_min, lat_max] for lon/lat data,
+        or [x_min, x_max, y_min, y_max] for initialized Cartesian data.
+    spectrum_var : str
+        Either:
+        - "shell_integrated_spectrum"
+        - "spectral_density"
     """
+
     if base_colors is None:
         base_colors = {
-            "Winter": "winter",
-            "Summer": "summer",
-            "Spring": "spring",
-            "Autumn": "autumn",
+            "Winter": "Blues",
+            "Summer": "Reds",
+            "Spring": "Greens",
+            "Autumn": "Oranges",
         }
 
     ylabel_map = {
-        "shell_integrated_spectrum": r"Shell contribution to mean KE [m$^2$ s$^{-2}$]",
-        "spectral_density": r"Spectral density [(m$^2$ s$^{-2}$)/(m$^{-1}$)]",
+        "shell_integrated_spectrum": r"Shell contribution to mean KE (m$^2$ s$^{-2}$)",
+        "spectral_density": r"Spectral density ((m$^2$ s$^{-2}$)/(m$^{-1}$))",
     }
 
     if spectrum_var not in ylabel_map:
         raise ValueError("spectrum_var must be 'shell_integrated_spectrum' or 'spectral_density'")
 
-    fig, ax = plt.subplots(figsize=ptheme.get_figsize("wide"))
+    plt.figure(figsize=(10, 7))
 
     for season, years in data_groups.items():
-        cmap_key = base_colors.get(season, "default")
-        cmap = ptheme.get_cmap(cmap_key)
+        cmap = plt.get_cmap(base_colors.get(season, "viridis"))
         shades = np.linspace(0.4, 0.9, len(years))
 
         for idx, (year_label, path) in enumerate(years.items()):
@@ -1761,7 +1647,7 @@ def plot_EDS_seasonal(
                 temporal_skip_days=temporal_skip_days,
                 temporal_stride_days=temporal_stride_days,
                 min_modes_per_bin=min_modes_per_bin,
-                rose_scale_bands_km=None,
+                rose_scale_bands_km=None,  # not needed for this plot
             )
 
             length_km = eds["characteristic_length"].values / 1000.0
@@ -1769,32 +1655,25 @@ def plot_EDS_seasonal(
 
             valid = np.isfinite(length_km) & np.isfinite(E) & (length_km > 0) & (E > 0)
 
-            ax.loglog(
+            plt.loglog(
                 length_km[valid],
                 E[valid],
                 "-o",
                 label=f"{season} {year_label}",
                 color=cmap(shades[idx]),
-                lw=ptheme.THICK_LINE_WIDTH,
-                ms=ptheme.MARKER_SIZE,
+                lw=2,
+                ms=5,
                 alpha=0.95,
             )
 
-    ax.set_xlabel("Characteristic length [km]")
-    ax.set_ylabel(ylabel_map[spectrum_var])
-    ax.set_title(title)
-    ax.grid(True, which="both", alpha=ptheme.GRID_ALPHA)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=True)
+    plt.xlabel("Characteristic length (km)")
+    plt.ylabel(ylabel_map[spectrum_var])
+    plt.title(title, fontsize=14)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.grid(True, which="both", alpha=0.2)
 
     if xlim_km is not None:
-        ax.set_xlim(xlim_km)
+        plt.xlim(xlim_km)
 
-    fig.tight_layout()
-
-    ptheme.save_figure(fig, save_path, save=save) if save_path is not None else None
-
-    if show:
-        plt.show()
-
-    return fig, ax
-
+    plt.tight_layout()
+    plt.show()

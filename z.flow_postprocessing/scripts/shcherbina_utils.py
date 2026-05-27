@@ -1,9 +1,167 @@
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+
+# ============================================================
+# SHARED THESIS PLOTTING STYLE
+# ============================================================
+
+# The module is normally located in:
+#   THESIS/z.flow_postprocessing/scripts/shcherbina_utils.py
+# while the shared theme is located in:
+#   THESIS/theme/plot_theme.py
+# This small block keeps the utility module usable from notebooks in
+# different subfolders.
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "theme" / "plot_theme.py").exists():
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        break
+
+try:
+    import theme.plot_theme as ptheme
+except Exception:  # fallback when the shared theme is unavailable
+    ptheme = None
+
+
+def apply_plot_style():
+    """Apply the shared thesis plotting style with a white background."""
+    if ptheme is not None and hasattr(ptheme, "apply_theme"):
+        ptheme.apply_theme()
+    else:
+        plt.style.use("default")
+        plt.rcParams.update({
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.transparent": False,
+            "font.size": 14,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "legend.fontsize": 12,
+            "axes.grid": True,
+            "grid.alpha": 0.35,
+        })
+
+    # Enforce this even if the selected style changes later.
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.transparent": False,
+    })
+
+
+def get_figsize(kind="map"):
+    """Return a shared figure size, with safe fallbacks."""
+    if ptheme is not None and hasattr(ptheme, "get_figsize"):
+        try:
+            return ptheme.get_figsize(kind)
+        except Exception:
+            pass
+
+    fallback = {
+        "map": (7, 5),
+        "wide": (10, 5),
+        "panel": (15, 5),
+        "square": (7, 6),
+        "small": (6, 4),
+    }
+    return fallback.get(kind, fallback["map"])
+
+
+def get_color(name="default"):
+    """Return a shared semantic color, with safe fallbacks."""
+    if ptheme is not None and hasattr(ptheme, "get_color"):
+        try:
+            return ptheme.get_color(name)
+        except Exception:
+            pass
+
+    fallback = {
+        "default": "#003755",
+        "secondary": "#01CBE1",
+        "highlight": "#D61418",
+        "reference": "0.25",
+        "grid": "0.65",
+    }
+    return fallback.get(name, name)
+
+
+def get_cmap(category=None):
+    """Return a shared colormap, accepting both semantic names and Matplotlib names."""
+    if category is None:
+        category = "default"
+
+    if ptheme is not None and hasattr(ptheme, "get_cmap"):
+        try:
+            return ptheme.get_cmap(category)
+        except Exception:
+            pass
+
+    semantic = {
+        "rossby": "RdBu_r",
+        "divergence": "RdBu_r",
+        "strain": "turbo",
+        "temperature": "turbo",
+        "jpdf": "turbo",
+        "conditional": "RdBu_r",
+        "categorical": "tab20",
+        "default": "viridis",
+    }
+    return plt.get_cmap(semantic.get(category, category))
+
+
+def _theme_attr(name, fallback):
+    if ptheme is not None and hasattr(ptheme, name):
+        return getattr(ptheme, name)
+    return fallback
+
+
+def format_axis(ax, title=None, xlabel=None, ylabel=None, grid=True, equal=False):
+    """Consistent formatting for regular Cartesian axes."""
+    ax.set_facecolor("white")
+
+    if title is not None:
+        ax.set_title(title)
+    if xlabel is not None:
+        ax.set_xlabel(xlabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+
+    ax.grid(grid, alpha=_theme_attr("GRID_ALPHA", 0.35))
+
+    if equal:
+        ax.set_aspect("equal", adjustable="box")
+
+    return ax
+
+
+def add_colorbar(fig, ax, mappable, label="", extend="neither"):
+    """Add a consistently styled colorbar."""
+    cbar = fig.colorbar(
+        mappable,
+        ax=ax,
+        extend=extend,
+        pad=_theme_attr("COLORBAR_PAD", 0.035),
+        fraction=_theme_attr("COLORBAR_FRACTION", 0.046),
+        aspect=_theme_attr("COLORBAR_ASPECT", 25),
+    )
+    cbar.set_label(label)
+    return cbar
+
+
+# Apply once at import. Notebooks may still call apply_plot_style() after reload.
+apply_plot_style()
 
 
 # ============================================================
@@ -274,16 +432,7 @@ def compute_pro_per_square(ro, squares, threshold):
 
 def savefig_if_needed(fig, filename_base, save=False, out_dir=None, dpi=None):
     """
-    Save figure if save=True.
-
-    Parameters
-    ----------
-    fig : matplotlib.figure.Figure
-    filename_base : str
-        Filename without extension.
-    save : bool
-    out_dir : path-like
-    dpi : int or None
+    Save figure if save=True, using the shared white-background style.
     """
     if not save:
         return None
@@ -295,33 +444,68 @@ def savefig_if_needed(fig, filename_base, save=False, out_dir=None, dpi=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if dpi is None:
-        dpi = plt.rcParams["figure.dpi"]
+        dpi = _theme_attr("SAVE_DPI", 300)
 
     png_path = out_dir / f"{filename_base}.png"
+
+    fig.patch.set_facecolor("white")
+    for ax in fig.axes:
+        ax.set_facecolor("white")
+
     fig.canvas.draw()
-    fig.savefig(png_path, bbox_inches="tight", dpi=dpi)
+    fig.savefig(
+        png_path,
+        bbox_inches="tight",
+        dpi=dpi,
+        facecolor="white",
+        transparent=False,
+    )
     print(f"Saved: {png_path}")
 
     return png_path
 
 
-def plot_map(field, title="", cbar_label="", cmap=None, vmin=None, vmax=None,
-             dx=500.0, dy=500.0, figsize=(7, 5)):
+def plot_map(
+    field,
+    title="",
+    cbar_label="",
+    cmap=None,
+    vmin=None,
+    vmax=None,
+    dx=500.0,
+    dy=500.0,
+    figsize=None,
+    xlabel="x [km]",
+    ylabel="y [km]",
+    grid=True,
+    extend="neither",
+):
     """
-    Map plot on a uniform Cartesian grid.
+    Consistent map plot on a uniform Cartesian grid.
 
     Returns
     -------
     fig, ax
         Returning these explicitly avoids blank saved figures.
     """
+    apply_plot_style()
+
+    if figsize is None:
+        figsize = get_figsize("map")
+
+    if cmap is None:
+        cmap = get_cmap("default")
+    elif isinstance(cmap, str):
+        cmap = get_cmap(cmap)
+
     field = np.asarray(field)
     ny, nx = field.shape[-2], field.shape[-1]
 
     x_edges_km = np.arange(nx + 1) * dx / 1000.0
     y_edges_km = np.arange(ny + 1) * dy / 1000.0
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
 
     pcm = ax.pcolormesh(
         x_edges_km,
@@ -333,25 +517,43 @@ def plot_map(field, title="", cbar_label="", cmap=None, vmin=None, vmax=None,
         vmax=vmax,
     )
 
-    cbar = fig.colorbar(pcm, ax=ax)
-    cbar.set_label(cbar_label)
+    add_colorbar(fig, ax, pcm, label=cbar_label, extend=extend)
 
-    ax.set_xlabel("x [km]")
-    ax.set_ylabel("y [km]")
-    ax.set_title(title)
     ax.set_xlim(x_edges_km[0], x_edges_km[-1])
     ax.set_ylim(y_edges_km[0], y_edges_km[-1])
+
+    format_axis(
+        ax,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        grid=grid,
+        equal=True,
+    )
 
     fig.tight_layout()
 
     return fig, ax
 
 
-def plot_pdf_panel(ax, data, bins, title, xlabel, color_line="red", show_zero_line=True):
+def plot_pdf_panel(
+    ax,
+    data,
+    bins,
+    title,
+    xlabel,
+    color_line=None,
+    show_zero_line=True,
+):
     """
     Histogram bins + normalized PDF line + summary stats,
-    in a Shcherbina-style presentation.
+    using the shared thesis style.
     """
+    apply_plot_style()
+
+    if color_line is None:
+        color_line = get_color("highlight")
+
     data = np.asarray(data, dtype=float)
     data = data[np.isfinite(data)]
 
@@ -366,15 +568,26 @@ def plot_pdf_panel(ax, data, bins, title, xlabel, color_line="red", show_zero_li
         hist_n,
         width=widths,
         align="center",
-        facecolor="0.85",
-        edgecolor="0.25",
-        linewidth=0.7,
+        facecolor="0.88",
+        edgecolor="0.35",
+        linewidth=_theme_attr("THIN_LINE_WIDTH", 0.8),
     )
 
-    ax.plot(centers, hist_n, color=color_line, lw=1.3)
+    ax.plot(
+        centers,
+        hist_n,
+        color=color_line,
+        lw=_theme_attr("THICK_LINE_WIDTH", 2.0),
+    )
 
     if show_zero_line:
-        ax.axvline(0.0, color="k", ls="--", lw=0.8, alpha=0.8)
+        ax.axvline(
+            0.0,
+            color=get_color("reference"),
+            ls="--",
+            lw=_theme_attr("LINE_WIDTH", 1.2),
+            alpha=_theme_attr("REFERENCE_ALPHA", 0.8),
+        )
 
     s = stats_dict(data)
 
@@ -392,14 +605,14 @@ def plot_pdf_panel(ax, data, bins, title, xlabel, color_line="red", show_zero_li
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=10,
+        fontsize=_theme_attr("ANNOTATION_SIZE", 10),
+        bbox=dict(facecolor="white", edgecolor="0.80", alpha=0.85, pad=3),
     )
 
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("PDF")
+    format_axis(ax, title=title, xlabel=xlabel, ylabel="PDF", grid=False)
     ax.set_ylim(bottom=0)
-    ax.grid(False)
+
+    return ax
 
 
 def add_regime_labels(ax, x_edges, y_edges):
@@ -412,23 +625,47 @@ def add_regime_labels(ax, x_edges, y_edges):
     xrng = x1 - x0
     yrng = y1 - y0
 
-    ax.text(x0 + 0.10 * xrng, y0 + 0.10 * yrng, "AVD", fontsize=14)
-    ax.text(x0 + 0.38 * xrng, y0 + 0.72 * yrng, "SD", fontsize=14)
-    ax.text(x0 + 0.84 * xrng, y0 + 0.10 * yrng, "CVD", fontsize=14, ha="right")
+    label_kwargs = dict(
+        fontsize=_theme_attr("LABEL_SIZE", 14),
+        color=get_color("reference"),
+        fontweight="bold",
+    )
+
+    ax.text(x0 + 0.10 * xrng, y0 + 0.10 * yrng, "AVD", **label_kwargs)
+    ax.text(x0 + 0.38 * xrng, y0 + 0.72 * yrng, "SD", **label_kwargs)
+    ax.text(x0 + 0.84 * xrng, y0 + 0.10 * yrng, "CVD", ha="right", **label_kwargs)
 
 
-def plot_square_overlay(ro, squares, dx, dy, title="", cmap="RdBu_r",
-                        vmin=-2, vmax=2, figsize=(8, 6)):
+def plot_square_overlay(
+    ro,
+    squares,
+    dx,
+    dy,
+    title="",
+    cmap="RdBu_r",
+    vmin=-2,
+    vmax=2,
+    figsize=None,
+):
     """
     Plot Rossby number with discretized square overlay and square IDs.
     """
+    apply_plot_style()
+
+    if figsize is None:
+        figsize = get_figsize("map")
+
+    if isinstance(cmap, str):
+        cmap = get_cmap(cmap)
+
     ro = np.asarray(ro)
     ny, nx = ro.shape
 
     x_edges_km = np.arange(nx + 1) * dx / 1000.0
     y_edges_km = np.arange(ny + 1) * dy / 1000.0
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
 
     pcm = ax.pcolormesh(
         x_edges_km,
@@ -440,8 +677,9 @@ def plot_square_overlay(ro, squares, dx, dy, title="", cmap="RdBu_r",
         vmax=vmax,
     )
 
-    cbar = fig.colorbar(pcm, ax=ax)
-    cbar.set_label(r"$\zeta/f$")
+    add_colorbar(fig, ax, pcm, label=r"$\zeta/f$", extend="both")
+
+    overlay_color = get_color("reference")
 
     for sq in squares:
         x0_km = x_edges_km[sq["x0"]]
@@ -454,8 +692,8 @@ def plot_square_overlay(ro, squares, dx, dy, title="", cmap="RdBu_r",
             x1_km - x0_km,
             y1_km - y0_km,
             fill=False,
-            edgecolor="k",
-            linewidth=0.8,
+            edgecolor=overlay_color,
+            linewidth=_theme_attr("LINE_WIDTH", 1.2),
         )
         ax.add_patch(rect)
 
@@ -468,16 +706,231 @@ def plot_square_overlay(ro, squares, dx, dy, title="", cmap="RdBu_r",
             str(sq["square_id"]),
             ha="center",
             va="center",
-            fontsize=8,
-            color="k",
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.8),
+            fontsize=_theme_attr("ANNOTATION_SIZE", 10),
+            color=overlay_color,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=1.0),
         )
 
     ax.set_xlim(x_edges_km[0], x_edges_km[-1])
     ax.set_ylim(y_edges_km[0], y_edges_km[-1])
-    ax.set_xlabel("x [km]")
-    ax.set_ylabel("y [km]")
-    ax.set_title(title)
+
+    format_axis(
+        ax,
+        title=title,
+        xlabel="x [km]",
+        ylabel="y [km]",
+        grid=True,
+        equal=True,
+    )
+
+    fig.tight_layout()
+
+    return fig, ax
+
+
+def plot_jpdf(
+    x_edges,
+    y_edges,
+    H_log,
+    title="",
+    xlabel="",
+    ylabel="",
+    cbar_label=r"$\log_{10}(P/P_{\max})$",
+    cmap="jpdf",
+    vmin=-2,
+    vmax=0,
+    figsize=None,
+    diagonal_abs=False,
+    zero_lines=False,
+    regime_labels=False,
+):
+    """
+    Consistent JPDF plot for log-normalized 2D histograms.
+    """
+    apply_plot_style()
+
+    if figsize is None:
+        figsize = get_figsize("square")
+
+    if isinstance(cmap, str):
+        cmap = get_cmap(cmap)
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
+
+    pcm = ax.pcolormesh(
+        x_edges,
+        y_edges,
+        H_log.T,
+        shading="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    add_colorbar(fig, ax, pcm, label=cbar_label)
+
+    if diagonal_abs:
+        xx = np.linspace(x_edges[0], x_edges[-1], 500)
+        ax.plot(
+            xx,
+            np.abs(xx),
+            "--",
+            color=get_color("reference"),
+            lw=_theme_attr("LINE_WIDTH", 1.2),
+            alpha=_theme_attr("REFERENCE_ALPHA", 0.8),
+        )
+
+    if zero_lines:
+        ax.axvline(0.0, color=get_color("reference"), ls="--", lw=_theme_attr("THIN_LINE_WIDTH", 0.8))
+        ax.axhline(0.0, color=get_color("reference"), ls="--", lw=_theme_attr("THIN_LINE_WIDTH", 0.8))
+
+    if regime_labels:
+        add_regime_labels(ax, x_edges, y_edges)
+
+    format_axis(ax, title=title, xlabel=xlabel, ylabel=ylabel, grid=True)
+
+    fig.tight_layout()
+
+    return fig, ax
+
+
+def plot_conditional_mean(
+    x_edges,
+    y_edges,
+    mean_field,
+    title="",
+    xlabel="",
+    ylabel="",
+    cbar_label="",
+    cmap="conditional",
+    vlim=None,
+    percentile_limit=98,
+    figsize=None,
+    diagonal_abs=True,
+    regime_labels=True,
+):
+    """
+    Consistent conditional-mean plot, using symmetric color limits by default.
+    """
+    apply_plot_style()
+
+    if figsize is None:
+        figsize = get_figsize("square")
+
+    if isinstance(cmap, str):
+        cmap = get_cmap(cmap)
+
+    field = np.asarray(mean_field, dtype=float)
+
+    if vlim is None:
+        valid = np.isfinite(field)
+        if np.any(valid):
+            vlim = np.nanpercentile(np.abs(field[valid]), percentile_limit)
+        else:
+            vlim = 1.0
+
+    if not np.isfinite(vlim) or vlim == 0:
+        vlim = 1.0
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
+
+    pcm = ax.pcolormesh(
+        x_edges,
+        y_edges,
+        field.T,
+        shading="auto",
+        cmap=cmap,
+        vmin=-float(vlim),
+        vmax=float(vlim),
+    )
+
+    add_colorbar(fig, ax, pcm, label=cbar_label, extend="both")
+
+    if diagonal_abs:
+        xx = np.linspace(x_edges[0], x_edges[-1], 500)
+        ax.plot(
+            xx,
+            np.abs(xx),
+            "--",
+            color=get_color("reference"),
+            lw=_theme_attr("LINE_WIDTH", 1.2),
+            alpha=_theme_attr("REFERENCE_ALPHA", 0.8),
+        )
+
+    if regime_labels:
+        add_regime_labels(ax, x_edges, y_edges)
+
+    format_axis(ax, title=title, xlabel=xlabel, ylabel=ylabel, grid=True)
+
+    fig.tight_layout()
+
+    return fig, ax, float(vlim)
+
+
+def plot_pro_timeseries(
+    square_pro_wide,
+    plot_time_days=None,
+    threshold=0.5,
+    title="",
+    figsize=None,
+):
+    """
+    Consistent local PRo time-series plot with square IDs annotated at the end.
+    """
+    apply_plot_style()
+
+    if figsize is None:
+        figsize = get_figsize("wide")
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    ax.set_facecolor("white")
+
+    cmap = get_cmap("categorical")
+
+    for i, sq_id in enumerate(square_pro_wide.columns):
+        color = cmap((i % 20) / 19) if callable(cmap) else None
+        y = square_pro_wide[sq_id].values
+        x = square_pro_wide.index.values
+
+        ax.plot(
+            x,
+            y,
+            lw=_theme_attr("LINE_WIDTH", 1.2),
+            alpha=0.9,
+            color=color,
+        )
+
+        finite = np.isfinite(y)
+        if np.any(finite):
+            last_idx = np.where(finite)[0][-1]
+            ax.text(
+                x[last_idx] + 0.08,
+                y[last_idx],
+                str(int(sq_id)),
+                color=color,
+                fontsize=_theme_attr("ANNOTATION_SIZE", 10),
+                va="center",
+            )
+
+    if plot_time_days is not None:
+        ax.axvline(
+            plot_time_days,
+            color=get_color("reference"),
+            ls="--",
+            lw=_theme_attr("LINE_WIDTH", 1.2),
+            alpha=_theme_attr("REFERENCE_ALPHA", 0.8),
+        )
+
+    xmin = np.nanmin(square_pro_wide.index.values)
+    xmax = np.nanmax(square_pro_wide.index.values)
+    ax.set_xlim(xmin, xmax + 0.8)
+
+    if title == "":
+        title = f"Local PRo > {format_threshold(threshold)}"
+
+    format_axis(ax, title=title, xlabel="time [days]", ylabel="PRo", grid=True)
 
     fig.tight_layout()
 
