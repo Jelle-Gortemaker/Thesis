@@ -2,7 +2,10 @@ import os
 import sys
 from pathlib import Path
 
+import json
 import numpy as np
+import pandas as pd
+from scipy import ndimage
 import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -121,6 +124,112 @@ except Exception:  # fallback for standalone use
 # SHARED PLOTTING HELPERS
 # ============================================================
 
+def _is_glorys(ds):
+    return ("uo" in ds.data_vars) and ("vo" in ds.data_vars)
+
+
+def _is_mitgcm(ds):
+    return ("U" in ds.data_vars) and ("V" in ds.data_vars)
+
+
+def _center_mitgcm_u(u):
+    # U: (Y, Xp1) -> (Y, X)
+    return 0.5 * (u[:, :-1] + u[:, 1:])
+
+
+def _center_mitgcm_v(v):
+    # V: (Yp1, X) -> (Y, X)
+    return 0.5 * (v[:-1, :] + v[1:, :])
+
+
+def _crop_common_2d(*arrays):
+    ny = min(a.shape[-2] for a in arrays)
+    nx = min(a.shape[-1] for a in arrays)
+    return tuple(a[:ny, :nx] for a in arrays)
+
+
+def _extract_surface_uv_xy(ds):
+    """
+    Auto-detect GLORYS or MITgcm and return:
+      u, v       : 2D centered velocity arrays [m/s]
+      X, Y       : 2D Cartesian coordinates [m]
+      x1d, y1d   : 1D plotting/grid coordinates
+      dims       : tuple of native horizontal dim names
+      coords     : dict for xarray output
+      grid_type  : 'glorys' or 'mitgcm'
+    """
+    if _is_glorys(ds):
+        lon_dim = "longitude" if "longitude" in ds.dims else "lon"
+        lat_dim = "latitude" if "latitude" in ds.dims else "lat"
+
+        u_da = ds["uo"]
+        v_da = ds["vo"]
+
+        if "time" in u_da.dims:
+            u_da = u_da.isel(time=0)
+            v_da = v_da.isel(time=0)
+
+        if "depth" in u_da.dims:
+            u_da = u_da.isel(depth=0)
+            v_da = v_da.isel(depth=0)
+
+        u = u_da.transpose(lat_dim, lon_dim).values.astype(float)
+        v = v_da.transpose(lat_dim, lon_dim).values.astype(float)
+
+        lon = ds[lon_dim].values.astype(float)
+        lat = ds[lat_dim].values.astype(float)
+
+        R = 6371000.0
+        lon0 = float(np.nanmean(lon))
+        lat0 = float(np.nanmean(lat))
+
+        Lon, Lat = np.meshgrid(lon, lat)
+        X = np.deg2rad(Lon - lon0) * R * np.cos(np.deg2rad(lat0))
+        Y = np.deg2rad(Lat - lat0) * R
+
+        coords = {
+            lat_dim: lat,
+            lon_dim: lon,
+        }
+
+        return u, v, X, Y, lon, lat, (lat_dim, lon_dim), coords, "glorys"
+
+    if _is_mitgcm(ds):
+        u_da = ds["U"]
+        v_da = ds["V"]
+
+        if "T" in u_da.dims:
+            u_da = u_da.isel(T=0)
+            v_da = v_da.isel(T=0)
+
+        if "Z" in u_da.dims:
+            u_da = u_da.isel(Z=0)
+            v_da = v_da.isel(Z=0)
+
+        u_raw = u_da.values.astype(float)  # (Y, Xp1)
+        v_raw = v_da.values.astype(float)  # (Yp1, X)
+
+        u = _center_mitgcm_u(u_raw)
+        v = _center_mitgcm_v(v_raw)
+        u, v = _crop_common_2d(u, v)
+
+        x = ds["X"].values.astype(float)[:u.shape[1]]
+        y = ds["Y"].values.astype(float)[:u.shape[0]]
+
+        X, Y = np.meshgrid(x, y)
+
+        coords = {
+            "Y": y,
+            "X": x,
+        }
+
+        return u, v, X, Y, x, y, ("Y", "X"), coords, "mitgcm"
+
+    raise ValueError(
+        "Could not detect dataset type. Expected GLORYS variables uo/vo "
+        "or MITgcm variables U/V."
+    )
+
 def _apply_consistent_style():
     """Apply the shared thesis style and enforce a white background."""
     ptheme.apply_theme()
@@ -199,6 +308,7 @@ def _save_and_show(fig, save_path=None, save=False, show=True, close=False):
 
 def _valid_xy(x, y):
     return np.isfinite(x) & np.isfinite(y)
+
 def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0, time_range=None):
     """
     Loads, optionally subsets in time, averages, and extracts the surface layer from GLORYS data.
@@ -225,6 +335,18 @@ def process_glorys_data(filepath, averaging_period, depth_idx=0, time_idx=0, tim
 
     ds_resampled = ds.resample(time=averaging_period).mean()
     surface_ds = ds_resampled.isel(depth=depth_idx, time=time_idx)
+
+    # Keep lightweight metadata for later diagnostics / JSON naming.
+    surface_ds.attrs["source_file"] = str(filepath)
+    surface_ds.attrs["source_stem"] = Path(filepath).stem
+    surface_ds.attrs["averaging_period"] = str(averaging_period)
+    surface_ds.attrs["depth_idx"] = int(depth_idx)
+    surface_ds.attrs["time_idx"] = int(time_idx)
+
+    if time_range is not None:
+        surface_ds.attrs["time_range_start"] = str(time_range[0])
+        surface_ds.attrs["time_range_end"] = str(time_range[1])
+
     return surface_ds
 
 def get_subdomain(lat_min, lon_min, lat_max, lon_max):
@@ -234,57 +356,188 @@ def get_subdomain(lat_min, lon_min, lat_max, lon_max):
     """
     return [lon_min, lon_max, lat_min, lat_max]
 
+def calculate_box_turnover_time(
+    surface_ds,
+    target_box,
+    remove_mean=True,
+    save=False,
+    output_dir="../results/domain_characterization",
+    filename_prefix=None,
+):
+    """
+    Calculate a box-scale turnover time from GLORYS surface velocity.
 
+    Definition
+    ----------
+    T_box = L_box / U_rms
+
+    where:
+        L_box = sqrt(Lx_box * Ly_box)
+        U_rms = sqrt(<u'^2 + v'^2>) inside the target box
+
+    target_box format:
+        [lon_min, lon_max, lat_min, lat_max]
+
+    If save=True, writes a JSON file containing the turnover-time diagnostics
+    and the LES/target-box coordinates.
+    """
+    R = 6371000.0
+
+    lon_dim = "longitude" if "longitude" in surface_ds.dims else "lon"
+    lat_dim = "latitude" if "latitude" in surface_ds.dims else "lat"
+
+    lon_min, lon_max, lat_min, lat_max = map(float, target_box)
+
+    box_ds = surface_ds.sel(
+        **{
+            lon_dim: slice(lon_min, lon_max),
+            lat_dim: slice(lat_min, lat_max),
+        }
+    )
+
+    u = box_ds["uo"].values.astype(float)
+    v = box_ds["vo"].values.astype(float)
+
+    if remove_mean:
+        u_use = u - np.nanmean(u)
+        v_use = v - np.nanmean(v)
+    else:
+        u_use = u
+        v_use = v
+
+    U_rms = float(np.sqrt(np.nanmean(u_use**2 + v_use**2)))
+
+    lat_c = 0.5 * (lat_min + lat_max)
+
+    Lx_box_m = float(
+        np.deg2rad(lon_max - lon_min) * R * np.cos(np.deg2rad(lat_c))
+    )
+    Ly_box_m = float(
+        np.deg2rad(lat_max - lat_min) * R
+    )
+
+    L_box_m = float(np.sqrt(Lx_box_m * Ly_box_m))
+
+    T_box_seconds = float(L_box_m / U_rms)
+    T_box_days = float(T_box_seconds / 86400.0)
+
+    out = {
+        "method": "box_scale_turnover_time",
+        "definition": "T_box = L_box / U_rms, with L_box = sqrt(Lx_box * Ly_box)",
+        "source_file": surface_ds.attrs.get("source_file", ""),
+        "source_stem": surface_ds.attrs.get("source_stem", ""),
+        "averaging_period": surface_ds.attrs.get("averaging_period", ""),
+        "depth_idx": surface_ds.attrs.get("depth_idx", None),
+        "time_idx": surface_ds.attrs.get("time_idx", None),
+        "remove_mean_velocity": bool(remove_mean),
+        "target_box": {
+            "lon_min": lon_min,
+            "lon_max": lon_max,
+            "lat_min": lat_min,
+            "lat_max": lat_max,
+        },
+        "box_geometry": {
+            "Lx_box_m": Lx_box_m,
+            "Ly_box_m": Ly_box_m,
+            "L_box_m": L_box_m,
+            "Lx_box_km": Lx_box_m / 1000.0,
+            "Ly_box_km": Ly_box_m / 1000.0,
+            "L_box_km": L_box_m / 1000.0,
+        },
+        "velocity_scale": {
+            "U_rms_m_s": U_rms,
+        },
+        "turnover_time": {
+            "T_box_seconds": T_box_seconds,
+            "T_box_days": T_box_days,
+            "T_0p20_days": 0.20 * T_box_days,
+            "T_0p25_days": 0.25 * T_box_days,
+            "T_0p35_days": 0.35 * T_box_days,
+            "T_0p50_days": 0.50 * T_box_days,
+        },
+    }
+
+    if save:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if filename_prefix is None:
+            filename_prefix = surface_ds.attrs.get("source_stem", "surface_ds")
+
+        box_tag = (
+            f"lat{lat_min:.2f}_{lat_max:.2f}_"
+            f"lon{lon_min:.2f}_{lon_max:.2f}"
+        )
+        box_tag = box_tag.replace("-", "m").replace(".", "p")
+
+        json_path = output_dir / f"{filename_prefix}_{box_tag}_box_turnover.json"
+
+        with open(json_path, "w") as f:
+            json.dump(out, f, indent=2)
+
+        out["json_path"] = str(json_path)
+
+        print(f"Saved box-turnover JSON to: {json_path}")
+
+    return out
 
 def get_eddy_intensity(results, alpha=0.2):
     """
-    Returns vorticity only where OW passes the threshold.
+    Auto-compatible OW eddy-core mask.
     """
-    ow_param = results.w
-    vorticity = results.vorticity
+    ow_param = results["w"]
+    vorticity = results["vorticity"]
 
-    dims_to_std = [d for d in ['latitude', 'longitude', 'lat', 'lon'] if d in ow_param.coords]
-
-    sigma_W = ow_param.std(dim=dims_to_std)
+    sigma_W = ow_param.std(dim=list(ow_param.dims))
     ow_threshold = -alpha * sigma_W
 
     mask = xr.where(ow_param < ow_threshold, 1, 0)
     signed_intensity = vorticity.where(mask == 1)
 
+    signed_intensity.attrs.update(results.attrs)
+    mask.attrs.update(results.attrs)
+
     return signed_intensity, mask
 
 def calculate_okubo_weiss(ds_slice):
-    """Calculates Okubo-Weiss parameter and relative vorticity."""
-    R = 6371000
-    lon_dim = 'longitude' if 'longitude' in ds_slice.dims else 'lon'
-    lat_dim = 'latitude' if 'latitude' in ds_slice.dims else 'lat'
+    """
+    Auto-detecting OW calculation.
 
-    dlon_deg = np.mean(np.gradient(ds_slice[lon_dim].values))
-    dlat_deg = np.mean(np.gradient(ds_slice[lat_dim].values))
+    Works for:
+    - GLORYS: uo/vo on latitude/longitude
+    - MITgcm: U/V on staggered Xp1/Yp1 grid
 
-    dx = np.deg2rad(dlon_deg) * R * np.cos(np.deg2rad(ds_slice[lat_dim].values))
-    dy = np.deg2rad(dlat_deg) * R
+    Returns xr.Dataset with:
+    - w
+    - vorticity
+    """
+    u, v, X, Y, x1d, y1d, dims, coords, grid_type = _extract_surface_uv_xy(ds_slice)
 
-    grad_u = np.gradient(ds_slice.uo.values)
-    grad_v = np.gradient(ds_slice.vo.values)
+    dx = float(np.nanmean(np.abs(np.gradient(X, axis=1))))
+    dy = float(np.nanmean(np.abs(np.gradient(Y, axis=0))))
 
-    du_di, du_dj = grad_u[0], grad_u[1]
-    dv_di, dv_dj = grad_v[0], grad_v[1]
-
-    du_dx = du_dj / dx[:, None]
-    dv_dx = dv_dj / dx[:, None]
-    du_dy = du_di / dy
-    dv_dy = dv_di / dy
+    du_dy, du_dx = np.gradient(u, dy, dx)
+    dv_dy, dv_dx = np.gradient(v, dy, dx)
 
     sn = du_dx - dv_dy
     ss = dv_dx + du_dy
     omega = dv_dx - du_dy
     w = sn**2 + ss**2 - omega**2
 
-    return xr.Dataset({
-        'w': ((lat_dim, lon_dim), w),
-        'vorticity': ((lat_dim, lon_dim), omega),
-    }, coords=ds_slice.coords)
+    out = xr.Dataset(
+        {
+            "w": (dims, w),
+            "vorticity": (dims, omega),
+        },
+        coords=coords,
+        attrs={
+            "grid_type": grid_type,
+            "dx_m": dx,
+            "dy_m": dy,
+        },
+    )
+
+    return out
 
 
 def plot_ocean_field(
@@ -460,6 +713,559 @@ def plot_ocean_field(
 
     return fig, ax
 
+def infer_lon_lat_dims(ds_or_da):
+    """
+    Infer longitude and latitude dimension names.
+
+    Keeps the same longitude/latitude naming convention already used
+    throughout the OW and plotting routines.
+    """
+    lon_dim = "longitude" if "longitude" in ds_or_da.dims else "lon"
+    lat_dim = "latitude" if "latitude" in ds_or_da.dims else "lat"
+
+    if lon_dim not in ds_or_da.dims or lat_dim not in ds_or_da.dims:
+        raise ValueError(
+            f"Could not infer lon/lat dims. Available dims: {ds_or_da.dims}"
+        )
+
+    return lon_dim, lat_dim
+
+
+def local_xy_from_lonlat(ds_or_da):
+    """
+    Convert the lon/lat grid of a GLORYS slice to local Cartesian x/y in metres.
+
+    This uses the same local spherical approximation as calculate_okubo_weiss:
+        dx = dlon * R * cos(latitude)
+        dy = dlat * R
+
+    Returns
+    -------
+    X, Y : 2D arrays [m]
+        Local Cartesian coordinates on the same horizontal grid.
+    lon, lat : 1D arrays
+        Original longitude and latitude coordinates.
+    """
+    R = 6371000.0
+
+    lon_dim, lat_dim = infer_lon_lat_dims(ds_or_da)
+
+    lon = np.asarray(ds_or_da[lon_dim].values, dtype=float)
+    lat = np.asarray(ds_or_da[lat_dim].values, dtype=float)
+
+    lon0 = float(np.nanmean(lon))
+    lat0 = float(np.nanmean(lat))
+
+    Lon, Lat = np.meshgrid(lon, lat)
+
+    X = np.deg2rad(Lon - lon0) * R * np.cos(np.deg2rad(lat0))
+    Y = np.deg2rad(Lat - lat0) * R
+
+    return X, Y, lon, lat
+
+
+def radial_mean(r, q, r_edges, min_count=1):
+    """
+    Radial bin average.
+
+    Parameters
+    ----------
+    r : array
+        Radius [m].
+    q : array
+        Quantity to bin-average.
+    r_edges : array
+        Radial bin edges [m].
+    min_count : int
+        Minimum number of points per bin.
+
+    Returns
+    -------
+    r_mid : array
+        Bin centres [m].
+    q_mean : array
+        Mean q per bin.
+    counts : array
+        Number of valid points per bin.
+    """
+    r = np.asarray(r, dtype=float)
+    q = np.asarray(q, dtype=float)
+
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    q_mean = np.full(len(r_mid), np.nan)
+    counts = np.zeros(len(r_mid), dtype=int)
+
+    for i in range(len(r_mid)):
+        m = (
+            np.isfinite(r)
+            & np.isfinite(q)
+            & (r >= r_edges[i])
+            & (r < r_edges[i + 1])
+        )
+
+        counts[i] = np.count_nonzero(m)
+
+        if counts[i] >= min_count:
+            q_mean[i] = np.nanmean(q[m])
+
+    return r_mid, q_mean, counts
+
+
+def calculate_eddy_turnover_from_ow(
+    surface_ds,
+    ow_results=None,
+    eddy_mask=None,
+    alpha=0.2,
+    target_box=None,
+    min_cells=6,
+    n_radial_bins=20,
+    search_radius_factor=2.0,
+    remove_mean=True,
+    center_method="max_abs_vorticity",
+):
+    """
+    Auto-detecting ETT calculation.
+
+    Works for:
+    - GLORYS surface slices
+    - MITgcm post-spinup output
+
+    Definition:
+        T_eddy = 2*pi*R_max / |Utheta_max|
+    """
+    if ow_results is None:
+        ow_results = calculate_okubo_weiss(surface_ds)
+
+    if eddy_mask is None:
+        _, eddy_mask = get_eddy_intensity(ow_results, alpha=alpha)
+
+    u, v, X, Y, x1d, y1d, dims, coords, grid_type = _extract_surface_uv_xy(surface_ds)
+
+    zeta = ow_results["vorticity"].transpose(*dims).values.astype(float)
+    mask = eddy_mask.transpose(*dims).values.astype(bool)
+
+    if remove_mean:
+        u_use = u - np.nanmean(u)
+        v_use = v - np.nanmean(v)
+    else:
+        u_use = u.copy()
+        v_use = v.copy()
+
+    labels, n_labels = ndimage.label(mask, structure=np.ones((3, 3), dtype=int))
+
+    dx_m = float(ow_results.attrs.get("dx_m", np.nanmean(np.abs(np.gradient(X, axis=1)))))
+    dy_m = float(ow_results.attrs.get("dy_m", np.nanmean(np.abs(np.gradient(Y, axis=0)))))
+    cell_area_m2 = dx_m * dy_m
+
+    rows = []
+    profiles = {}
+
+    for label_id in range(1, n_labels + 1):
+        comp = labels == label_id
+        n_cells = int(np.count_nonzero(comp))
+
+        if n_cells < min_cells:
+            continue
+
+        zeta_core_mean = float(np.nanmean(zeta[comp]))
+
+        if not np.isfinite(zeta_core_mean) or zeta_core_mean == 0.0:
+            continue
+
+        polarity_sign = np.sign(zeta_core_mean)
+        polarity_name = "cyclonic" if zeta_core_mean > 0 else "anticyclonic"
+
+        if center_method == "max_abs_vorticity":
+            zeta_abs_core = np.where(comp, np.abs(zeta), np.nan)
+            j0, i0 = np.unravel_index(np.nanargmax(zeta_abs_core), zeta_abs_core.shape)
+        else:
+            raise ValueError("Only center_method='max_abs_vorticity' is supported.")
+
+        x0 = float(X[j0, i0])
+        y0 = float(Y[j0, i0])
+
+        # Keep GLORYS lon/lat centres if available
+        if grid_type == "glorys":
+            lon0 = float(x1d[i0])
+            lat0 = float(y1d[j0])
+
+            if target_box is not None:
+                lon_min, lon_max, lat_min, lat_max = target_box
+                inside_target = (
+                    lon_min <= lon0 <= lon_max
+                    and lat_min <= lat0 <= lat_max
+                )
+                if not inside_target:
+                    continue
+        else:
+            lon0 = np.nan
+            lat0 = np.nan
+
+        area_m2 = n_cells * cell_area_m2
+        r_eq_m = np.sqrt(area_m2 / np.pi)
+
+        dx0 = X - x0
+        dy0 = Y - y0
+        r = np.hypot(dx0, dy0)
+        theta = np.arctan2(dy0, dx0)
+
+        utheta = -u_use * np.sin(theta) + v_use * np.cos(theta)
+
+        r_search_m = search_radius_factor * r_eq_m
+
+        search_mask = (
+            np.isfinite(utheta)
+            & np.isfinite(r)
+            & (r > 0.0)
+            & (r <= r_search_m)
+        )
+
+        if np.count_nonzero(search_mask) < min_cells:
+            continue
+
+        radial_bin_width_m = max(dx_m, dy_m)
+        n_bins = int(np.ceil(r_search_m / radial_bin_width_m))
+        n_bins = max(n_bins, 2)
+
+        r_edges = np.linspace(0.0, r_search_m, n_bins + 1)
+
+        r_mid, utheta_mean, counts = radial_mean(
+            r[search_mask],
+            utheta[search_mask],
+            r_edges,
+            min_count=3,
+        )
+
+        swirl = polarity_sign * utheta_mean
+        valid = np.isfinite(swirl) & (counts > 0)
+
+        if not np.any(valid):
+            continue
+
+        valid_idx = np.where(valid)[0]
+        imax = valid_idx[int(np.nanargmax(swirl[valid]))]
+
+        R_max_m = float(r_mid[imax])
+        Utheta_max_signed = float(utheta_mean[imax])
+        Utheta_max_m_s = float(abs(Utheta_max_signed))
+
+        if (
+            not np.isfinite(R_max_m)
+            or not np.isfinite(Utheta_max_m_s)
+            or Utheta_max_m_s <= 0.0
+        ):
+            continue
+
+        T_seconds = 2.0 * np.pi * R_max_m / Utheta_max_m_s
+
+        distance_to_edge_m = float(
+            min(
+                x0 - np.nanmin(X),
+                np.nanmax(X) - x0,
+                y0 - np.nanmin(Y),
+                np.nanmax(Y) - y0,
+            )
+        )
+
+        rows.append({
+            "label": int(label_id),
+            "grid_type": grid_type,
+            "polarity": polarity_name,
+            "lon_center": lon0,
+            "lat_center": lat0,
+            "x_center_m": x0,
+            "y_center_m": y0,
+            "i_center": int(i0),
+            "j_center": int(j0),
+            "n_cells": n_cells,
+            "area_km2": area_m2 / 1e6,
+            "R_eq_km": r_eq_m / 1000.0,
+            "R_search_km": r_search_m / 1000.0,
+            "R_max_km": R_max_m / 1000.0,
+            "R_max_m": R_max_m,
+            "Utheta_max_m_s": Utheta_max_m_s,
+            "Utheta_max_signed_m_s": Utheta_max_signed,
+            "zeta_core_mean_s_inv": zeta_core_mean,
+            "T_eddy_hours": T_seconds / 3600.0,
+            "T_eddy_days": T_seconds / 86400.0,
+            "distance_to_edge_m": distance_to_edge_m,
+        })
+
+        profiles[int(label_id)] = {
+            "r_km": r_mid / 1000.0,
+            "utheta_mean_m_s": utheta_mean,
+            "swirl_profile_m_s": swirl,
+            "counts": counts,
+            "R_max_km": R_max_m / 1000.0,
+            "R_max_m": R_max_m,
+            "Utheta_max_m_s": Utheta_max_m_s,
+            "T_eddy_days": T_seconds / 86400.0,
+            "polarity": polarity_name,
+            "grid_type": grid_type,
+            "lon_center": lon0,
+            "lat_center": lat0,
+            "x_center_m": x0,
+            "y_center_m": y0,
+        }
+
+    eddy_table = pd.DataFrame(rows)
+
+    if len(eddy_table) > 0:
+        eddy_table = eddy_table.sort_values("area_km2", ascending=False).reset_index(drop=True)
+
+    labels_da = xr.DataArray(
+        labels,
+        dims=dims,
+        coords=coords,
+        name="ow_connected_eddy_labels",
+        attrs=ow_results.attrs,
+    )
+
+    return eddy_table, profiles, labels_da
+
+def plot_eddy_turnover_map(
+    signed_intensity,
+    eddy_table,
+    u=None,
+    v=None,
+    title="OW eddies with turnover-time centres",
+    target_box=None,
+    extent=None,
+    vabs=1.0e-5,
+    annotate=True,
+    show_radii=True,
+    radii_to_show=("R_max_km",),
+):
+    """
+    Auto-detecting OW/ETT map.
+
+    GLORYS -> lon/lat map.
+    MITgcm -> Cartesian x/y plot.
+    """
+    grid_type = signed_intensity.attrs.get("grid_type", "glorys")
+
+    fig, ax = plot_eddy_intensity(
+        signed_intensity,
+        u=u,
+        v=v,
+        title=title,
+        target_box=target_box,
+        extent=extent,
+        vabs=vabs,
+    )
+
+    if eddy_table is None or len(eddy_table) == 0:
+        return fig, ax, None
+
+    plot_table = eddy_table.copy().reset_index(drop=True)
+    plot_table["eddy_id"] = np.arange(1, len(plot_table) + 1)
+
+    if grid_type == "glorys":
+        R_earth = 6371000.0
+
+        for _, row in plot_table.iterrows():
+            lon_c = float(row["lon_center"])
+            lat_c = float(row["lat_center"])
+
+            ax.scatter(
+                lon_c,
+                lat_c,
+                s=50,
+                marker="o",
+                facecolor="white",
+                edgecolor="0.1",
+                linewidth=1.2,
+                transform=ccrs.PlateCarree(),
+                zorder=20,
+            )
+
+            if annotate:
+                ax.text(
+                    lon_c,
+                    lat_c,
+                    str(int(row["eddy_id"])),
+                    fontsize=getattr(ptheme, "ANNOTATION_SIZE", 10),
+                    fontweight="bold",
+                    color="0.05",
+                    ha="center",
+                    va="center",
+                    transform=ccrs.PlateCarree(),
+                    zorder=21,
+                )
+
+            if show_radii:
+                for radius_name in radii_to_show:
+                    if radius_name not in row or not np.isfinite(row[radius_name]):
+                        continue
+
+                    radius_m = float(row[radius_name]) * 1000.0
+                    dlat_deg = np.rad2deg(radius_m / R_earth)
+                    dlon_deg = np.rad2deg(
+                        radius_m / (R_earth * np.cos(np.deg2rad(lat_c)))
+                    )
+
+                    ellipse = patches.Ellipse(
+                        (lon_c, lat_c),
+                        width=2.0 * dlon_deg,
+                        height=2.0 * dlat_deg,
+                        facecolor="none",
+                        edgecolor="0.05",
+                        linewidth=2.0,
+                        alpha=0.85,
+                        transform=ccrs.PlateCarree(),
+                        zorder=19,
+                    )
+                    ax.add_patch(ellipse)
+
+    else:
+        for _, row in plot_table.iterrows():
+            x0_km = float(row["x_center_m"]) / 1000.0
+            y0_km = float(row["y_center_m"]) / 1000.0
+
+            ax.scatter(
+                x0_km,
+                y0_km,
+                s=50,
+                marker="o",
+                facecolor="white",
+                edgecolor="0.1",
+                linewidth=1.2,
+                zorder=20,
+            )
+
+            if annotate:
+                ax.text(
+                    x0_km,
+                    y0_km,
+                    str(int(row["eddy_id"])),
+                    fontsize=getattr(ptheme, "ANNOTATION_SIZE", 10),
+                    fontweight="bold",
+                    color="0.05",
+                    ha="center",
+                    va="center",
+                    zorder=21,
+                )
+
+            if show_radii:
+                for radius_name in radii_to_show:
+                    if radius_name not in row or not np.isfinite(row[radius_name]):
+                        continue
+
+                    radius_km = float(row[radius_name])
+
+                    circ = patches.Circle(
+                        (x0_km, y0_km),
+                        radius_km,
+                        facecolor="none",
+                        edgecolor="0.05",
+                        linewidth=2.0,
+                        alpha=0.85,
+                        zorder=19,
+                    )
+                    ax.add_patch(circ)
+
+    summary_cols = [
+        "eddy_id",
+        "label",
+        "polarity",
+        "R_eq_km",
+        "R_max_km",
+        "Utheta_max_m_s",
+        "T_eddy_days",
+    ]
+
+    summary_table = plot_table[[c for c in summary_cols if c in plot_table.columns]]
+
+    return fig, ax, summary_table
+
+def plot_eddy_turnover_profiles(
+    eddy_table,
+    profiles,
+    n=5,
+    labels=None,
+    title="Azimuthal velocity profiles of OW-detected eddies",
+    save_path=None,
+    save=False,
+    show=True,
+    close=False,
+):
+    """
+    Plot radial azimuthal velocity profiles for selected OW-detected eddies.
+
+    Uses the shared plot theme through:
+        _apply_consistent_style()
+        _figsize()
+        _set_white_background()
+        _style_cartesian_axis()
+        _color()
+        _save_and_show()
+    """
+    _apply_consistent_style()
+
+    if eddy_table is None or len(eddy_table) == 0:
+        print("No eddies available for turnover-profile plotting.")
+        return None
+
+    if labels is None:
+        selected = eddy_table.head(n)
+    else:
+        selected = eddy_table[eddy_table["label"].isin(labels)]
+
+    fig, ax = plt.subplots(
+        figsize=_figsize("profile_panel", fallback=(10, 5)),
+        facecolor="white",
+    )
+
+    _set_white_background(fig, ax)
+    _style_cartesian_axis(ax, grid=True)
+
+    for idx, (_, row) in enumerate(selected.iterrows()):
+        label_id = int(row["label"])
+
+        if label_id not in profiles:
+            continue
+
+        prof = profiles[label_id]
+
+        color = _color("default") if idx == 0 else None
+
+        ax.plot(
+            prof["r_km"],
+            prof["swirl_profile_m_s"],
+            marker="o",
+            markersize=getattr(ptheme, "MARKER_SIZE", 4),
+            linewidth=getattr(ptheme, "LINE_WIDTH", 1.2),
+            color=color,
+            label=(
+                f"label {label_id}, {prof['polarity']}, "
+                f"T={prof['T_eddy_days']:.1f} d"
+            ),
+        )
+
+        ax.axvline(
+            prof["R_max_km"],
+            linestyle="--",
+            linewidth=getattr(ptheme, "THIN_LINE_WIDTH", 0.8),
+            color=_color("reference", "0.25"),
+            alpha=getattr(ptheme, "REFERENCE_ALPHA", 0.8),
+        )
+
+    ax.set_xlabel("Radius from eddy centre [km]")
+    ax.set_ylabel("Polarity-corrected azimuthal velocity [m s$^{-1}$]")
+    ax.set_title(title)
+    ax.legend(frameon=True)
+
+    fig.tight_layout()
+
+    _save_and_show(
+        fig,
+        save_path=save_path,
+        save=save,
+        show=show,
+        close=close,
+    )
+
+    return fig
 
 def plot_eddy_intensity(
     intensity_data,
@@ -471,122 +1277,138 @@ def plot_eddy_intensity(
     vabs=1.0e-5,
 ):
     """
-    Plot eddy-core relative vorticity with fixed symmetric colorbar limits.
+    Auto-detecting eddy-intensity plot.
 
-    For animations or comparisons, pass the same vabs to all calls. A good
-    choice is a robust percentile of the detected, non-NaN vortex-core values.
+    GLORYS -> map plot.
+    MITgcm -> Cartesian x/y plot.
     """
-    if extent is None:
-        extent = [-155, -130, 20, 45]
+    grid_type = intensity_data.attrs.get("grid_type", "glorys")
 
-    return plot_ocean_field(
-        intensity_data,
-        u=u,
-        v=v,
-        title=title,
-        target_box=target_box,
-        extent=extent,
+    if grid_type == "glorys":
+        if extent is None:
+            extent = [-155, -130, 20, 45]
+
+        return plot_ocean_field(
+            intensity_data,
+            u=u,
+            v=v,
+            title=title,
+            target_box=target_box,
+            extent=extent,
+            cmap=_cmap("vorticity"),
+            label=r"Relative vorticity [s$^{-1}$]",
+            vabs=vabs,
+            vector_scale=15,
+        )
+
+    # MITgcm Cartesian plot
+    _apply_consistent_style()
+
+    y_dim, x_dim = intensity_data.dims
+    x = intensity_data[x_dim].values / 1000.0
+    y = intensity_data[y_dim].values / 1000.0
+    field = intensity_data.values
+
+    if vabs is None:
+        vals = np.abs(field[np.isfinite(field)])
+        vabs = np.nanpercentile(vals, 98) if vals.size > 0 else 1.0e-5
+
+    fig, ax = plt.subplots(figsize=_figsize("square", fallback=(7, 7)), facecolor="white")
+    _set_white_background(fig, ax)
+    _style_cartesian_axis(ax, grid=True)
+
+    im = ax.pcolormesh(
+        x,
+        y,
+        field,
+        shading="auto",
         cmap=_cmap("vorticity"),
-        label=r"Relative vorticity [s$^{-1}$]",
-        vabs=vabs,
-        vector_scale=15,
+        vmin=-vabs,
+        vmax=vabs,
     )
 
-def preprocess_netcdf(surface_ds, les_box, base_name, active=True, subtract_mean=False):
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(r"OW-core relative vorticity [s$^{-1}$]")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x [km]")
+    ax.set_ylabel("y [km]")
+    ax.set_title(title)
+
+    fig.tight_layout()
+
+    return fig, ax
+
+def summarize_ow_length_and_epsilon(
+    eddy_table,
+    U_rms,
+    dx_m,
+    dy_m,
+    min_rmax_cells=3.0,
+    boundary_factor=1.0,
+    min_utheta_m_s=1e-6,
+):
     """
-    Slice GLORYS data and save it in a format compatible with
-    VortexFitting's current `file_type='dns'` reader.
+    Quality-filter OW eddies and compute:
+      L_eddy = median accepted R_max
+      epsilon_proxy = U_rms^3 / L_eddy
     """
+    if eddy_table is None or len(eddy_table) == 0:
+        return eddy_table, {
+            "n_detected_eddies": 0,
+            "n_accepted_eddies": 0,
+            "L_eddy_median_Rmax_m": np.nan,
+            "L_eddy_area_weighted_Rmax_m": np.nan,
+            "Rmax_p25_m": np.nan,
+            "Rmax_p75_m": np.nan,
+            "T_eddy_median_days": np.nan,
+            "epsilon_proxy_m2_s3": np.nan,
+        }
 
-    if not active:
-        print("Vortex box saving is DEACTIVATED.")
-        return None
+    grid_scale = max(dx_m, dy_m)
 
-    # 1. Use the passed surface_ds directly
-    ds = surface_ds
+    accepted = eddy_table[
+        np.isfinite(eddy_table["R_max_m"])
+        & np.isfinite(eddy_table["Utheta_max_m_s"])
+        & (eddy_table["R_max_m"] >= min_rmax_cells * grid_scale)
+        & (eddy_table["Utheta_max_m_s"] >= min_utheta_m_s)
+        & (eddy_table["distance_to_edge_m"] >= boundary_factor * eddy_table["R_max_m"])
+    ].copy()
 
-    # 2. Slice requested box
-    lon_w, lon_e, lat_s, lat_n = les_box
-    sliced = ds.sel(longitude=slice(lon_w, lon_e), latitude=slice(lat_s, lat_n))
+    if len(accepted) == 0:
+        return accepted, {
+            "n_detected_eddies": int(len(eddy_table)),
+            "n_accepted_eddies": 0,
+            "L_eddy_median_Rmax_m": np.nan,
+            "L_eddy_area_weighted_Rmax_m": np.nan,
+            "Rmax_p25_m": np.nan,
+            "Rmax_p75_m": np.nan,
+            "T_eddy_median_days": np.nan,
+            "epsilon_proxy_m2_s3": np.nan,
+        }
 
-    # 3. Ensure time dimension exists
-    if "time" not in sliced.dims:
-        sliced = sliced.expand_dims(time=[0])
-
-    # 4. Keep depth as a singleton dimension (required by dns reader)
-    if "depth" in sliced.dims:
-        sliced = sliced.isel(depth=slice(0, 1))
-    else:
-        sliced = sliced.expand_dims(depth=[0.0])
-
-    # 5. Sort latitude so it increases monotonically
-    sliced = sliced.sortby("latitude")
-
-    # 6. Convert lon/lat to local Cartesian meters
-    R = 6371000.0
-    lon_vals = sliced["longitude"].values
-    lat_vals = sliced["latitude"].values
-
-    lon0 = float(lon_vals[0])
-    lat0 = float(lat_vals[0])
-    mean_lat = float(np.mean(lat_vals))
-
-    x_m = (lon_vals - lon0) * (np.pi / 180.0) * R * np.cos(np.deg2rad(mean_lat))
-    y_m = (lat_vals - lat0) * (np.pi / 180.0) * R
-
-    # 7. Rename velocity variables only
-    compat = sliced.rename({
-        "uo": "velocity_x",
-        "vo": "velocity_y"
-    })
-
-    # 8. Replace coordinate VALUES, but keep coordinate NAMES
-    compat = compat.assign_coords(
-        longitude=("longitude", x_m.astype(np.float64)),
-        latitude=("latitude", y_m.astype(np.float64))
+    L_eddy_median = float(np.nanmedian(accepted["R_max_m"]))
+    L_eddy_area_weighted = float(
+        np.nansum(accepted["R_max_m"] * accepted["area_km2"])
+        / np.nansum(accepted["area_km2"])
     )
 
-    # 9. Optional background-flow subtraction
-    if subtract_mean:
-        compat["velocity_x"] = compat["velocity_x"] - compat["velocity_x"].mean(
-            dim=("latitude", "longitude")
-        )
-        compat["velocity_y"] = compat["velocity_y"] - compat["velocity_y"].mean(
-            dim=("latitude", "longitude")
-        )
+    epsilon_proxy = float(U_rms**3 / L_eddy_median)
 
-    # 10. Add dummy vertical velocity component
-    compat["velocity_z"] = xr.zeros_like(compat["velocity_x"])
+    summary = {
+        "n_detected_eddies": int(len(eddy_table)),
+        "n_accepted_eddies": int(len(accepted)),
+        "L_eddy_median_Rmax_m": L_eddy_median,
+        "L_eddy_area_weighted_Rmax_m": L_eddy_area_weighted,
+        "Rmax_p25_m": float(np.nanpercentile(accepted["R_max_m"], 25)),
+        "Rmax_p75_m": float(np.nanpercentile(accepted["R_max_m"], 75)),
+        "T_eddy_median_days": float(np.nanmedian(accepted["T_eddy_days"])),
+        "epsilon_proxy_m2_s3": epsilon_proxy,
+        "epsilon_proxy_W_kg": epsilon_proxy,
+        "definition": "epsilon_proxy = U_rms^3 / median(R_max) using accepted OW eddies",
+    }
 
-    # 11. Keep only what the dns reader needs
-    compat = compat[["velocity_x", "velocity_y", "velocity_z"]]
-
-    # 12. Enforce exact dimension order expected by the dns reader
-    compat = compat.transpose("time", "depth", "latitude", "longitude")
-
-    # 13. Add metadata
-    compat["longitude"].attrs["units"] = "m"
-    compat["latitude"].attrs["units"] = "m"
-    compat["depth"].attrs["units"] = "m"
-    compat["velocity_x"].attrs["units"] = "m s-1"
-    compat["velocity_y"].attrs["units"] = "m s-1"
-    compat["velocity_z"].attrs["units"] = "m s-1"
-
-    # 14. Build output filename (using a default base_name since input_path is gone)
-    coord_suffix = f"_{abs(int(lat_s))}-{abs(int(lat_n))}N_{abs(int(lon_w))}-{abs(int(lon_e))}W"
-    output_filename = f"../data/{base_name}{coord_suffix}.nc"
-
-    # 15. Save
-    compat.to_netcdf(output_filename)
-
-    # 16. Diagnostics
-    print(f"Saved to: {output_filename}")
-    print("velocity_x dims :", compat["velocity_x"].dims)
-    print("velocity_x shape:", compat["velocity_x"].shape)
-    print("longitude range :", float(compat["longitude"].values[0]), "to", float(compat["longitude"].values[-1]), "m")
-    print("latitude range  :", float(compat["latitude"].values[0]), "to", float(compat["latitude"].values[-1]), "m")
-
-    return output_filename
+    return accepted.reset_index(drop=True), summary
 
 
 from pathlib import Path
