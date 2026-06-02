@@ -1411,11 +1411,6 @@ def summarize_ow_length_and_epsilon(
     return accepted.reset_index(drop=True), summary
 
 
-from pathlib import Path
-import numpy as np
-import xarray as xr
-
-
 def infer_horizontal_dims(da, depth_dim):
     ignored_dims = {depth_dim, "time", "time_counter", "t"}
     spatial_dims = [dim for dim in da.dims if dim not in ignored_dims]
