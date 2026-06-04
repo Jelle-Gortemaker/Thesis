@@ -110,64 +110,12 @@ def _center_v_to_y(v: xr.DataArray, x: np.ndarray, y: np.ndarray, time: np.ndarr
     )
 
 
-
-
-
-def _add_velocity_derivative_fields(
-    ds_parcels: xr.Dataset,
-    dx: float,
-    dy: float,
-    dt: float,
-) -> xr.Dataset:
-    """
-    Add derivative fields needed by the slow-manifold Maxey-Riley kernel.
-
-    All quantities assume a flat Cartesian grid:
-        U, V             [m s-1]
-        x, y             [m]
-        time             [s]
-        dUdt, dVdt       [m s-2]
-        dUdx, dUdy, ...  [s-1]
-    """
-    U = np.asarray(ds_parcels["U"].values, dtype=np.float64)
-    V = np.asarray(ds_parcels["V"].values, dtype=np.float64)
-
-    dUdt = np.gradient(U, float(dt), axis=0, edge_order=1)
-    dVdt = np.gradient(V, float(dt), axis=0, edge_order=1)
-
-    dUdy, dUdx = np.gradient(U, float(dy), float(dx), axis=(-2, -1), edge_order=1)
-    dVdy, dVdx = np.gradient(V, float(dy), float(dx), axis=(-2, -1), edge_order=1)
-
-    dims = ("time", "y", "x")
-    coords = {"time": ds_parcels["time"], "y": ds_parcels["y"], "x": ds_parcels["x"]}
-
-    ds_parcels["dUdt"] = xr.DataArray(dUdt.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdt"] = xr.DataArray(dVdt.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dUdx"] = xr.DataArray(dUdx.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dUdy"] = xr.DataArray(dUdy.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdx"] = xr.DataArray(dVdx.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdy"] = xr.DataArray(dVdy.astype(np.float32), dims=dims, coords=coords)
-
-    ds_parcels["dUdt"].attrs.update(units="m s-2", long_name="time derivative of U")
-    ds_parcels["dVdt"].attrs.update(units="m s-2", long_name="time derivative of V")
-    for name in ["dUdx", "dUdy", "dVdx", "dVdy"]:
-        ds_parcels[name].attrs.update(units="s-1", long_name=name)
-
-    ds_parcels.attrs["contains_mr_sm_derivatives"] = True
-    ds_parcels.attrs["dx_m"] = float(dx)
-    ds_parcels.attrs["dy_m"] = float(dy)
-    ds_parcels.attrs["dt_s"] = float(dt)
-
-    return ds_parcels
-
-
 def mitgcm_cgrid_to_parcels_dataset(
     path: str | Path,
     level_indices: Sequence[int] = (0,),
     time_step_seconds: float = 10800.0,
     use_dataset_time: bool = False,
     chunks: Optional[dict] = None,
-    add_derivatives: bool = True,
 ) -> tuple[xr.Dataset, FieldMeta]:
     """
     Convert your MITgcm C-grid NetCDF to a Parcels-ready flat-grid dataset.
@@ -234,16 +182,6 @@ def mitgcm_cgrid_to_parcels_dataset(
         },
     )
 
-    if add_derivatives:
-        dx = float(np.nanmedian(np.diff(x)))
-        dy = float(np.nanmedian(np.diff(y)))
-        ds_parcels = _add_velocity_derivative_fields(
-            ds_parcels,
-            dx=dx,
-            dy=dy,
-            dt=float(np.nanmedian(np.diff(time))) if len(time) > 1 else float(time_step_seconds),
-        )
-
     return ds_parcels, meta
 
 
@@ -256,7 +194,6 @@ def build_fieldset(
     time_step_seconds: float = 10800.0,
     use_dataset_time: bool = False,
     periodic: bool = True,
-    add_derivatives: bool = True,
 ) -> tuple[FieldSet, FieldMeta, xr.Dataset]:
     """
     Build a Parcels FieldSet from your fixed MITgcm C-grid format.
@@ -270,19 +207,9 @@ def build_fieldset(
         time_step_seconds=time_step_seconds,
         use_dataset_time=use_dataset_time,
         chunks=chunks,
-        add_derivatives=add_derivatives,
     )
 
     variables = {"U": "U", "V": "V"}
-    if add_derivatives:
-        variables.update({
-            "dUdt": "dUdt",
-            "dVdt": "dVdt",
-            "dUdx": "dUdx",
-            "dUdy": "dUdy",
-            "dVdx": "dVdx",
-            "dVdy": "dVdy",
-        })
     dimensions = {"lon": "x", "lat": "y", "time": "time"}
 
     fieldset = FieldSet.from_xarray_dataset(
