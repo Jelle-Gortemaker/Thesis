@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+from logging import config
 from pathlib import Path
 from typing import Literal, Optional
 import json
@@ -56,11 +57,12 @@ class RunConfig:
     particle_tag: Optional[str] = None
     particle_label: Optional[str] = None
 
-    # Slow-manifold Maxey-Riley particle properties.
-    B: float = 1.0                       # rho_particle / rho_fluid
-    diameter_m: float = 0.0              # particle diameter [m]
-    nu_m2_s: float = 1.0e-6              # water kinematic viscosity [m2/s]
-    f0: float = 0.0                      # f-plane Coriolis parameter [s-1]
+    # Slow-manifold MR effective response time.
+    # This is the only particle-control parameter used by default.
+    tau_p_seconds: float = 0.0
+
+    # f-plane Coriolis parameter [s-1].
+    f0: float = 0.0
 
     # Drag correction mode:
     #   "none"     -> C(Rep)=1
@@ -94,11 +96,8 @@ def _safe_number(x: float, precision: int = 4) -> str:
 def make_particle_tag(
     *,
     particle_class: str,
-    B: float = 1.0,
-    diameter_m: float = 0.0,
+    tau_p_seconds: float = 0.0,
     stokes_number: float = np.nan,
-    drag_correction: str = "none",
-    C_Rep: float = 1.0,
 ) -> str:
     """Create a compact file-safe particle class tag."""
     if particle_class == "passive":
@@ -109,38 +108,30 @@ def make_particle_tag(
 
     return (
         "mrsm_"
-        f"B{_safe_number(B)}_"
-        f"d{_safe_number(diameter_m)}m_"
-        f"St{_safe_number(stokes_number)}_"
-        f"drag{drag_correction}_"
-        f"C{_safe_number(C_Rep)}"
+        f"tau{_safe_number(tau_p_seconds)}s_"
+        f"St{_safe_number(stokes_number)}"
     )
 
 
 def make_particle_label(
     *,
     particle_class: str,
-    B: float = 1.0,
-    diameter_m: float = 0.0,
-    tau_s: float = 0.0,
-    tau_eff_nominal: float = 0.0,
+    tau_p_seconds: float = 0.0,
     stokes_number: float = np.nan,
-    drag_correction: str = "none",
-    C_Rep: float = 1.0,
 ) -> str:
-    """Create a display label for plots and legends."""
+    """Create a compact display label for plots and legends."""
     if particle_class == "passive":
         return "Tracer"
 
     if particle_class != "mr_sm":
         raise ValueError(f"Unknown particle_class: {particle_class}")
 
-    st_txt = "nan" if not np.isfinite(stokes_number) else f"{stokes_number:.3g}"
-    return (
-        "MR-SM "
-        f"d={diameter_m:g} m, "
-        f"St={st_txt}"
-    )
+    tau_h = float(tau_p_seconds) / 3600.0
+
+    if np.isfinite(stokes_number):
+        return f"tau={tau_h:g} h, St={stokes_number:.3g}"
+
+    return f"tau={tau_h:g} h"
 
 
 def _grid_spacing_1d(a: np.ndarray) -> float:
@@ -295,26 +286,9 @@ def particle_class_parameters(config: RunConfig) -> dict:
     if config.particle_class != "mr_sm":
         raise ValueError(f"Unknown particle_class: {config.particle_class}")
 
-    tau_s = stokes_relaxation_time_seconds(
-        B=config.B,
-        diameter_m=config.diameter_m,
-        nu_m2_s=config.nu_m2_s,
-    )
-
-    C_Rep = float(config.C_Rep)
-    if C_Rep <= 0.0:
-        raise ValueError("C_Rep must be positive.")
-
-    if config.drag_correction == "none":
-        tau_eff_nominal = tau_s
-    elif config.drag_correction == "constant":
-        tau_eff_nominal = tau_s / C_Rep
-    elif config.drag_correction == "flexible":
-        # For flexible drag, C(Rep) varies during the run. Store tau_s as the
-        # nominal response time and write C_Rep_current as an output diagnostic.
-        tau_eff_nominal = tau_s
-    else:
-        raise ValueError("drag_correction must be 'none', 'constant', or 'flexible'.")
+    tau_p = float(config.tau_p_seconds)
+    if tau_p <= 0.0:
+        raise ValueError("tau_p_seconds must be positive for mr_sm particles.")
 
     if config.flow_timescale_seconds is None:
         stokes_number = np.nan
@@ -322,33 +296,26 @@ def particle_class_parameters(config: RunConfig) -> dict:
         tref = float(config.flow_timescale_seconds)
         if tref <= 0.0:
             raise ValueError("flow_timescale_seconds must be positive.")
-        stokes_number = tau_eff_nominal / tref
+        stokes_number = tau_p / tref
 
     tag = config.particle_tag or make_particle_tag(
         particle_class=config.particle_class,
-        B=config.B,
-        diameter_m=config.diameter_m,
+        tau_p_seconds=tau_p,
         stokes_number=stokes_number,
-        drag_correction=config.drag_correction,
-        C_Rep=C_Rep,
     )
     label = config.particle_label or make_particle_label(
         particle_class=config.particle_class,
-        B=config.B,
-        diameter_m=config.diameter_m,
-        tau_s=tau_s,
-        tau_eff_nominal=tau_eff_nominal,
-        stokes_number=stokes_number,
-        drag_correction=config.drag_correction,
-        C_Rep=C_Rep,
+    tau_p_seconds=tau_p,
+    stokes_number=stokes_number,
     )
 
     return {
         "particle_class_id": 1,
-        "drag_mode_id": drag_mode_id(config.drag_correction),
-        "tau_s_seconds": float(tau_s),
-        "tau_eff_nominal_seconds": float(tau_eff_nominal),
-        "C_Rep": float(C_Rep),
+        "drag_mode_id": 0,
+        "tau_s_seconds": float(tau_p),
+        "tau_p_seconds": float(tau_p),
+        "tau_eff_nominal_seconds": float(tau_p),
+        "C_Rep": 1.0,
         "stokes_number": float(stokes_number),
         "particle_tag": tag,
         "particle_label": label,
@@ -420,9 +387,6 @@ def run_parcels_experiment(config: RunConfig) -> dict:
 
     if config.particle_class == "mr_sm":
         fieldset.add_constant("f0", float(config.f0))
-        fieldset.add_constant("nu", float(config.nu_m2_s))
-        fieldset.add_constant("mr_drag_mode", int(params["drag_mode_id"]))
-        fieldset.add_constant("Rep_max", float(config.Rep_max))
 
     lon0, lat0 = prepare_release(config, ds)
 
@@ -453,11 +417,11 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         release_id=release_id,
         particle_class_id=np.full(n, int(params["particle_class_id"]), dtype=np.int32),
         drag_mode_id=np.full(n, int(params["drag_mode_id"]), dtype=np.int32),
-        B=np.full(n, float(config.B), dtype=np.float32),
-        diameter=np.full(n, float(config.diameter_m), dtype=np.float32),
-        tau_p=np.full(n, float(params["tau_s_seconds"]), dtype=np.float32),
+        B=np.ones(n, dtype=np.float32),
+        diameter=np.zeros(n, dtype=np.float32),
+        tau_p=np.full(n, float(params["tau_p_seconds"]), dtype=np.float32),
         tau_eff_nominal=np.full(n, float(params["tau_eff_nominal_seconds"]), dtype=np.float32),
-        C_Rep=np.full(n, float(params["C_Rep"]), dtype=np.float32),
+        C_Rep=np.ones(n, dtype=np.float32),
         stokes_number=np.full(n, float(params["stokes_number"]), dtype=np.float32),
         Rep=np.zeros(n, dtype=np.float32),
         uslip=np.zeros(n, dtype=np.float32),
@@ -504,12 +468,8 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         "periodic": bool(config.periodic),
         "level_indices": tuple(config.level_indices),
         "particle_class": config.particle_class,
-        "B": float(config.B),
-        "diameter_m": float(config.diameter_m),
-        "nu_m2_s": float(config.nu_m2_s),
+        "tau_p_seconds": float(config.tau_p_seconds),
         "f0": float(config.f0),
-        "drag_correction": config.drag_correction,
-        "Rep_max": float(config.Rep_max),
         "flow_timescale_seconds": (
             None if config.flow_timescale_seconds is None
             else float(config.flow_timescale_seconds)

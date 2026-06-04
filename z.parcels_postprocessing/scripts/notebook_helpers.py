@@ -90,39 +90,15 @@ def stokes_relaxation_time_seconds(B: float, diameter_m: float, nu_m2_s: float) 
 
 
 def build_particle_specs(
-    mr_sm_specs: Iterable[dict[str, Any]] | None = None,
+    tau_p_seconds_list: Iterable[float] | None = None,
     *,
     include_passive: bool = True,
     flow_timescale_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Build particle specifications for the run notebook.
+    Build particle specs using tau_p directly.
 
-    Parameters
-    ----------
-    mr_sm_specs
-        Iterable of dictionaries, for example::
-
-            {
-                "B": 0.68,
-                "diameter_m": 0.25,
-                "nu_m2_s": 1.0e-6,
-                "f0": 7.5e-5,
-                "drag_correction": "constant",
-                "C_Rep": 1.0,
-            }
-
-    include_passive
-        Whether to include a passive tracer class.
-    flow_timescale_seconds
-        Reference timescale used only to compute and store Stokes number.
-
-    Returns
-    -------
-    list of dict
-        Each entry can be passed into ``scripts.run.RunConfig``. The returned
-        dictionaries contain both a file-safe ``tag`` and a plot-friendly
-        ``label``.
+    tau_p_seconds is the only particle-control parameter for MR-SM particles.
     """
     specs: list[dict[str, Any]] = []
 
@@ -131,70 +107,46 @@ def build_particle_specs(
             "particle_class": "passive",
             "tag": "passive",
             "label": "Tracer",
-            "B": 1.0,
-            "diameter_m": 0.0,
-            "nu_m2_s": 1.0e-6,
-            "f0": 0.0,
-            "drag_correction": "none",
-            "C_Rep": 1.0,
-            "Rep_max": 0.0,
+            "tau_p_seconds": 0.0,
             "tau_s_seconds": 0.0,
             "tau_eff_nominal_seconds": 0.0,
             "stokes_number": 0.0,
             "flow_timescale_seconds": flow_timescale_seconds,
         })
 
-    if mr_sm_specs is None:
-        mr_sm_specs = []
+    if tau_p_seconds_list is None:
+        tau_p_seconds_list = []
 
-    for raw in mr_sm_specs:
-        cfg = dict(raw)
-        B = float(cfg.get("B", 1.0))
-        diameter_m = float(cfg["diameter_m"])
-        nu_m2_s = float(cfg.get("nu_m2_s", 1.0e-6))
-        drag_correction = cfg.get("drag_correction", "constant")
-        C_Rep = float(cfg.get("C_Rep", 1.0))
-        Rep_max = float(cfg.get("Rep_max", 5000.0))
-        f0 = float(cfg.get("f0", 0.0))
+    for tau_p in tau_p_seconds_list:
+        tau_p = float(tau_p)
 
-        tau_s = stokes_relaxation_time_seconds(B, diameter_m, nu_m2_s)
-        if drag_correction == "constant":
-            tau_eff = tau_s / C_Rep
-        else:
-            tau_eff = tau_s
+        if tau_p <= 0.0:
+            raise ValueError("All tau_p_seconds values must be positive.")
 
         if flow_timescale_seconds is None:
             stokes_number = np.nan
         else:
-            stokes_number = tau_eff / float(flow_timescale_seconds)
+            stokes_number = tau_p / float(flow_timescale_seconds)
 
-        tag = cfg.get("tag") or (
-            "mrsm_"
-            f"B{_safe_number(B)}_"
-            f"d{_safe_number(diameter_m)}m_"
-            f"St{_safe_number(stokes_number)}_"
-            f"drag{drag_correction}_"
-            f"C{_safe_number(C_Rep)}"
+        tau_h = tau_p / 3600.0
+
+        tag = (
+            f"mrsm_tau{_safe_number(tau_p)}s_"
+            f"St{_safe_number(stokes_number)}"
         )
 
-        st_txt = "nan" if not np.isfinite(stokes_number) else f"{stokes_number:.3g}"
-        label = cfg.get("label") or (
-            f"MR-SM d={diameter_m:g} m, St={st_txt}"
-        )
+        if np.isfinite(stokes_number):
+            label = f"tau={tau_h:g} h, St={stokes_number:.3g}"
+        else:
+            label = f"tau={tau_h:g} h"
 
         specs.append({
             "particle_class": "mr_sm",
             "tag": tag,
             "label": label,
-            "B": B,
-            "diameter_m": diameter_m,
-            "nu_m2_s": nu_m2_s,
-            "f0": f0,
-            "drag_correction": drag_correction,
-            "C_Rep": C_Rep,
-            "Rep_max": Rep_max,
-            "tau_s_seconds": tau_s,
-            "tau_eff_nominal_seconds": tau_eff,
+            "tau_p_seconds": tau_p,
+            "tau_s_seconds": tau_p,
+            "tau_eff_nominal_seconds": tau_p,
             "stokes_number": stokes_number,
             "flow_timescale_seconds": flow_timescale_seconds,
         })
@@ -205,16 +157,10 @@ def build_particle_specs(
 def print_particle_specs(particle_specs: list[dict[str, Any]]) -> None:
     print("Particle classes:")
     for spec in particle_specs:
-        print(f"  {spec['tag']} | {spec['label']}")
         print(
-            "    "
-            f"class={spec.get('particle_class')}, "
-            f"d={spec.get('diameter_m')} m, "
-            f"B={spec.get('B')}, "
-            f"tau_s={spec.get('tau_s_seconds')} s, "
-            f"St={spec.get('stokes_number')}, "
-            f"drag={spec.get('drag_correction')}, "
-            f"C={spec.get('C_Rep')}"
+            f"  {spec['tag']} | {spec['label']} | "
+            f"tau_p={spec.get('tau_p_seconds')} s | "
+            f"St={spec.get('stokes_number')}"
         )
 
 def get_xy_names(ds: xr.Dataset) -> tuple[str, str]:
