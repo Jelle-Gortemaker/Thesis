@@ -376,6 +376,54 @@ def find_first_pdf_intersection(x: np.ndarray, pdf: np.ndarray, pdf_ref: np.ndar
 
     return np.nan
 
+def find_second_pdf_intersection(x: np.ndarray, pdf: np.ndarray, pdf_ref: np.ndarray) -> float:
+    """
+    Find the high-area ('void') intersection between measured and Poisson PDFs.
+
+    This is the second crossing:
+    first crossing -> cluster threshold nu_c
+    second crossing -> void threshold nu_v
+    """
+    x = np.asarray(x, dtype=float)
+    pdf = np.asarray(pdf, dtype=float)
+    pdf_ref = np.asarray(pdf_ref, dtype=float)
+
+    ref_max = np.nanmax(pdf_ref) if np.any(np.isfinite(pdf_ref)) else np.nan
+    ref_ok = pdf_ref > (1e-3 * ref_max if np.isfinite(ref_max) and ref_max > 0 else 0.0)
+    mask = np.isfinite(x) & np.isfinite(pdf) & np.isfinite(pdf_ref) & ref_ok
+
+    x = x[mask]
+    diff = (pdf - pdf_ref)[mask]
+
+    if x.size < 5:
+        return np.nan
+
+    order = np.argsort(x)
+    x = x[order]
+    diff = diff[order]
+
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=float)
+    kernel /= kernel.sum()
+    diff_s = np.convolve(diff, kernel, mode="same")
+
+    crossings = []
+    for i in range(1, len(x)):
+        if diff_s[i - 1] == 0:
+            crossings.append(float(x[i - 1]))
+        elif diff_s[i - 1] * diff_s[i] < 0:
+            denom = diff_s[i] - diff_s[i - 1]
+            if denom == 0:
+                xc = float(x[i])
+            else:
+                frac = -diff_s[i - 1] / denom
+                xc = float(x[i - 1] + frac * (x[i] - x[i - 1]))
+            crossings.append(xc)
+
+    if len(crossings) >= 2:
+        return crossings[1]
+
+    return np.nan
+
 
 def voronoi_area_pdf_for_snapshot(
     areas: np.ndarray,
@@ -432,6 +480,145 @@ def voronoi_area_pdf_for_snapshot(
         "sigma_area_norm": float(np.nanstd(area_norm)),
         "sigma_log_area_norm": float(np.nanstd(np.log(area_norm))),
     }
+
+def compute_voronoi_pdf_aggregate(
+    ds_traj: xr.Dataset,
+    obs_indices: Iterable[int],
+    domain: PeriodicDomain,
+    *,
+    bins: np.ndarray | None = None,
+) -> xr.Dataset:
+    """
+    Aggregate Voronoï normalized-area PDFs over multiple snapshots,
+    in Monchaux-style variable nu = A/<A>.
+    """
+    xname, yname = get_xy_names(ds_traj)
+    obs_indices = list(obs_indices)
+
+    all_area_norm = []
+
+    for obs_idx in obs_indices:
+        x = ds_traj[xname].isel(obs=obs_idx).values
+        y = ds_traj[yname].isel(obs=obs_idx).values
+
+        result = periodic_voronoi_snapshot(x, y, domain)
+        area_norm = _normalized_valid_areas(result["cell_area"])
+
+        if area_norm.size > 0:
+            all_area_norm.append(area_norm)
+
+    if len(all_area_norm) == 0:
+        raise ValueError("No valid Voronoï areas found for aggregate PDF.")
+
+    area_norm_all = np.concatenate(all_area_norm)
+
+    if bins is None:
+        bins = np.logspace(-2, 1.2, 70)   # good default for Monchaux-style plots
+
+    hist, edges = np.histogram(area_norm_all, bins=bins, density=True)
+    centers = np.sqrt(edges[:-1] * edges[1:])   # geometric centers for log bins
+
+    pdf_ref = poisson_voronoi_area_pdf_2d(centers)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        relative_pdf = hist / pdf_ref
+    relative_pdf[~np.isfinite(relative_pdf)] = np.nan
+
+    nu_c = find_first_pdf_intersection(centers, hist, pdf_ref)
+    nu_v = find_second_pdf_intersection(centers, hist, pdf_ref)
+
+    return xr.Dataset(
+        data_vars={
+            "pdf": ("bin", hist.astype(float)),
+            "pdf_poisson": ("bin", pdf_ref.astype(float)),
+            "relative_pdf": ("bin", relative_pdf.astype(float)),
+            "cluster_threshold_nu_c": xr.DataArray(float(nu_c)),
+            "void_threshold_nu_v": xr.DataArray(float(nu_v)),
+            "n_samples": xr.DataArray(int(area_norm_all.size)),
+        },
+        coords={
+            "bin": np.arange(len(centers), dtype=int),
+            "nu": ("bin", centers.astype(float)),
+            "bin_left": ("bin", edges[:-1].astype(float)),
+            "bin_right": ("bin", edges[1:].astype(float)),
+        },
+        attrs={
+            "description": "Aggregate Monchaux-style Voronoi area PDF in nu=A/<A>.",
+            "n_obs_aggregated": int(len(obs_indices)),
+        },
+    )
+
+def plot_voronoi_pdf_monchaux(
+    pdf_ds: xr.Dataset,
+    *,
+    axes=None,
+    particle_label: str = "particles",
+    color="tab:blue",
+    title_prefix: str | None = None,
+):
+    """
+    Monchaux-style two-panel Voronoï PDF figure.
+
+    Panel (a): PDF of nu = A/<A>
+    Panel (b): relative PDF = PDF / PDF_poisson
+    """
+    if axes is None:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), facecolor="white")
+    else:
+        fig = axes[0].figure
+
+    ax1, ax2 = axes
+
+    nu = np.asarray(pdf_ds["nu"].values, dtype=float)
+    pdf = np.asarray(pdf_ds["pdf"].values, dtype=float)
+    pdf_ref = np.asarray(pdf_ds["pdf_poisson"].values, dtype=float)
+    rel = np.asarray(pdf_ds["relative_pdf"].values, dtype=float)
+
+    nu_c = float(pdf_ds["cluster_threshold_nu_c"].values)
+    nu_v = float(pdf_ds["void_threshold_nu_v"].values)
+
+    pdf_plot = np.where(pdf > 0, pdf, np.nan)
+    ref_plot = np.where(pdf_ref > 0, pdf_ref, np.nan)
+    rel_plot = np.where(rel > 0, rel, np.nan)
+
+    # Panel (a)
+    ax1.plot(nu, pdf_plot, color=color, lw=2.0, label=particle_label)
+    ax1.plot(nu, ref_plot, color="0.25", lw=1.5, ls="--", label="Poisson")
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
+    ax1.set_xlabel(r"$\nu$")
+    ax1.set_ylabel("PDF")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # Panel (b)
+    ax2.plot(nu, rel_plot, color="0.35", lw=2.0)
+    ax2.axhline(1.0, color="0.15", lw=1.0, ls="-.")
+    if np.isfinite(nu_c):
+        ax2.axvline(nu_c, color="0.35", lw=1.0, ls=":")
+        ax2.text(nu_c, 70, r"$\nu_c$", ha="center", va="bottom")
+    if np.isfinite(nu_v):
+        ax2.axvline(nu_v, color="0.35", lw=1.0, ls=":")
+        ax2.text(nu_v, 70, r"$\nu_v$", ha="center", va="bottom")
+
+    if np.isfinite(nu_c):
+        ax2.axvspan(nu.min(), nu_c, color="0.3", alpha=0.25)
+        ax2.text(max(nu.min() * 1.8, 0.02), 20, "Clusters", color="white")
+    if np.isfinite(nu_v):
+        ax2.axvspan(nu_v, nu.max(), color="0.7", alpha=0.25)
+        ax2.text(nu_v * 1.25, 20, "Voids", color="0.2")
+
+    ax2.set_xscale("log")
+    ax2.set_yscale("log")
+    ax2.set_xlabel(r"$\nu$")
+    ax2.set_ylabel("relative PDF")
+    ax2.grid(True, alpha=0.3)
+
+    if title_prefix is not None:
+        fig.suptitle(title_prefix)
+
+    fig.tight_layout()
+    return fig, axes
 
 
 def compute_voronoi_summary(

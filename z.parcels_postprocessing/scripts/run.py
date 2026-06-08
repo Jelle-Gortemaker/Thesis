@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import timedelta
-from logging import config
 from pathlib import Path
 from typing import Literal, Optional
 import json
@@ -52,27 +51,19 @@ class RunConfig:
     # Particle class for this run.
     particle_class: Literal["passive", "mr_sm"] = "passive"
 
-    # Optional human-readable identifiers. If omitted, they are generated from
-    # the particle parameters below.
+    # Optional human-readable identifiers. If omitted, they are generated from tau_p.
     particle_tag: Optional[str] = None
     particle_label: Optional[str] = None
 
-    # Slow-manifold MR effective response time.
-    # This is the only particle-control parameter used by default.
+    # Tau-only MR-SM control parameter.
+    # Passive tracer: tau_p_seconds = 0.0
+    # MR-SM particle: tau_p_seconds > 0.0
     tau_p_seconds: float = 0.0
 
-    # f-plane Coriolis parameter [s-1].
+    # f-plane Coriolis parameter [s-1]. Used only for MR-SM.
     f0: float = 0.0
 
-    # Drag correction mode:
-    #   "none"     -> C(Rep)=1
-    #   "constant" -> C(Rep)=C_Rep
-    #   "flexible" -> C(Rep) from current slip estimate
-    drag_correction: Literal["none", "constant", "flexible"] = "constant"
-    C_Rep: float = 1.0
-    Rep_max: float = 5000.0
-
-    # Used only for labelling / storing St. The kernel uses tau_s and C(Rep).
+    # Used only for labelling / storing St = tau_p / flow_timescale_seconds.
     flow_timescale_seconds: Optional[float] = None
 
     # Kept for future extension; current implementation initializes all classes
@@ -91,6 +82,19 @@ def _safe_number(x: float, precision: int = 4) -> str:
         return "nan"
     s = f"{float(x):.{precision}g}"
     return s.replace("-", "m").replace("+", "").replace(".", "p")
+
+
+def _format_tau_label(tau_seconds: float) -> str:
+    """Compact label for a relaxation time in seconds."""
+    tau_seconds = float(tau_seconds)
+
+    if tau_seconds >= 86400.0 and np.isclose(tau_seconds % 86400.0, 0.0):
+        return f"{tau_seconds / 86400.0:g} d"
+    if tau_seconds >= 3600.0 and np.isclose(tau_seconds % 3600.0, 0.0):
+        return f"{tau_seconds / 3600.0:g} h"
+    if tau_seconds >= 60.0 and np.isclose(tau_seconds % 60.0, 0.0):
+        return f"{tau_seconds / 60.0:g} min"
+    return f"{tau_seconds:g} s"
 
 
 def make_particle_tag(
@@ -126,12 +130,12 @@ def make_particle_label(
     if particle_class != "mr_sm":
         raise ValueError(f"Unknown particle_class: {particle_class}")
 
-    tau_h = float(tau_p_seconds) / 3600.0
+    tau_txt = _format_tau_label(tau_p_seconds)
 
     if np.isfinite(stokes_number):
-        return f"tau={tau_h:g} h, St={stokes_number:.3g}"
+        return f"tau={tau_txt}, St={stokes_number:.3g}"
 
-    return f"tau={tau_h:g} h"
+    return f"tau={tau_txt}"
 
 
 def _grid_spacing_1d(a: np.ndarray) -> float:
@@ -240,40 +244,13 @@ def _sample_initial_fluid_velocity(
     return U0, V0
 
 
-def drag_mode_id(mode: str) -> int:
-    if mode == "none":
-        return 0
-    if mode == "constant":
-        return 1
-    if mode == "flexible":
-        return 2
-    raise ValueError("drag_correction must be 'none', 'constant', or 'flexible'.")
-
-
-def stokes_relaxation_time_seconds(B: float, diameter_m: float, nu_m2_s: float) -> float:
-    """
-    Stokes relaxation time for the slow-manifold Maxey-Riley model:
-
-        tau_s = d^2 (1 + 2B) / (36 nu)
-    """
-    B = float(B)
-    diameter_m = float(diameter_m)
-    nu_m2_s = float(nu_m2_s)
-
-    if diameter_m <= 0.0:
-        raise ValueError("diameter_m must be positive for mr_sm particles.")
-    if nu_m2_s <= 0.0:
-        raise ValueError("nu_m2_s must be positive for mr_sm particles.")
-
-    return diameter_m**2 * (1.0 + 2.0 * B) / (36.0 * nu_m2_s)
-
-
 def particle_class_parameters(config: RunConfig) -> dict:
     """Return numeric parameters and labels for a single run config."""
     if config.particle_class == "passive":
-        info = {
+        return {
             "particle_class_id": 0,
             "drag_mode_id": 0,
+            "tau_p_seconds": 0.0,
             "tau_s_seconds": 0.0,
             "tau_eff_nominal_seconds": 0.0,
             "C_Rep": 1.0,
@@ -281,7 +258,6 @@ def particle_class_parameters(config: RunConfig) -> dict:
             "particle_tag": config.particle_tag or "passive",
             "particle_label": config.particle_label or "Tracer",
         }
-        return info
 
     if config.particle_class != "mr_sm":
         raise ValueError(f"Unknown particle_class: {config.particle_class}")
@@ -303,17 +279,18 @@ def particle_class_parameters(config: RunConfig) -> dict:
         tau_p_seconds=tau_p,
         stokes_number=stokes_number,
     )
+
     label = config.particle_label or make_particle_label(
         particle_class=config.particle_class,
-    tau_p_seconds=tau_p,
-    stokes_number=stokes_number,
+        tau_p_seconds=tau_p,
+        stokes_number=stokes_number,
     )
 
     return {
         "particle_class_id": 1,
         "drag_mode_id": 0,
-        "tau_s_seconds": float(tau_p),
         "tau_p_seconds": float(tau_p),
+        "tau_s_seconds": float(tau_p),
         "tau_eff_nominal_seconds": float(tau_p),
         "C_Rep": 1.0,
         "stokes_number": float(stokes_number),
@@ -426,7 +403,7 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         Rep=np.zeros(n, dtype=np.float32),
         uslip=np.zeros(n, dtype=np.float32),
         vslip=np.zeros(n, dtype=np.float32),
-        C_Rep_current=np.full(n, float(params["C_Rep"]), dtype=np.float32),
+        C_Rep_current=np.ones(n, dtype=np.float32),
         up=up0.astype(np.float32),
         vp=vp0.astype(np.float32),
     )
@@ -453,6 +430,8 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         output_file=pfile,
     )
 
+    tau_p_for_metadata = float(params["tau_p_seconds"])
+
     info = {
         **params,
         "input_nc": str(config.input_nc),
@@ -464,11 +443,12 @@ def run_parcels_experiment(config: RunConfig) -> dict:
         "runtime_days": float(config.runtime_days),
         "dt_seconds": int(config.dt_seconds),
         "outputdt_seconds": int(config.outputdt_seconds),
+        "time_step_seconds": int(config.time_step_seconds),
         "surface_only": bool(config.surface_only),
         "periodic": bool(config.periodic),
         "level_indices": tuple(config.level_indices),
         "particle_class": config.particle_class,
-        "tau_p_seconds": float(config.tau_p_seconds),
+        "tau_p_seconds": tau_p_for_metadata,
         "f0": float(config.f0),
         "flow_timescale_seconds": (
             None if config.flow_timescale_seconds is None

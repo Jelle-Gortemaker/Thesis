@@ -112,6 +112,63 @@ def _center_v_to_y(v: xr.DataArray, x: np.ndarray, y: np.ndarray, time: np.ndarr
 
 
 
+def _gradient_axis_float32(a: np.ndarray, spacing: float, axis: int) -> np.ndarray:
+    """
+    Memory-light finite difference along one axis.
+
+    Uses:
+        central difference inside the domain
+        first-order one-sided difference at boundaries
+
+    Output is float32.
+    """
+    a = np.asarray(a, dtype=np.float32)
+    spacing = float(spacing)
+
+    if spacing <= 0.0:
+        raise ValueError("spacing must be positive")
+
+    out = np.empty_like(a, dtype=np.float32)
+
+    sl_all = [slice(None)] * a.ndim
+
+    # Interior: central difference
+    sl_mid = sl_all.copy()
+    sl_p = sl_all.copy()
+    sl_m = sl_all.copy()
+
+    sl_mid[axis] = slice(1, -1)
+    sl_p[axis] = slice(2, None)
+    sl_m[axis] = slice(None, -2)
+
+    out[tuple(sl_mid)] = (
+        a[tuple(sl_p)] - a[tuple(sl_m)]
+    ) / np.float32(2.0 * spacing)
+
+    # Lower boundary: forward difference
+    sl_0 = sl_all.copy()
+    sl_1 = sl_all.copy()
+
+    sl_0[axis] = 0
+    sl_1[axis] = 1
+
+    out[tuple(sl_0)] = (
+        a[tuple(sl_1)] - a[tuple(sl_0)]
+    ) / np.float32(spacing)
+
+    # Upper boundary: backward difference
+    sl_last = sl_all.copy()
+    sl_prev = sl_all.copy()
+
+    sl_last[axis] = -1
+    sl_prev[axis] = -2
+
+    out[tuple(sl_last)] = (
+        a[tuple(sl_last)] - a[tuple(sl_prev)]
+    ) / np.float32(spacing)
+
+    return out
+
 
 def _add_velocity_derivative_fields(
     ds_parcels: xr.Dataset,
@@ -120,7 +177,7 @@ def _add_velocity_derivative_fields(
     dt: float,
 ) -> xr.Dataset:
     """
-    Add derivative fields needed by the slow-manifold Maxey-Riley kernel.
+    Add derivative fields needed by the tau-only slow-manifold MR kernel.
 
     All quantities assume a flat Cartesian grid:
         U, V             [m s-1]
@@ -128,28 +185,56 @@ def _add_velocity_derivative_fields(
         time             [s]
         dUdt, dVdt       [m s-2]
         dUdx, dUdy, ...  [s-1]
+
+    This version avoids np.gradient because np.gradient creates large float64
+    temporary arrays and can trigger MemoryError for full MITgcm fields.
     """
-    U = np.asarray(ds_parcels["U"].values, dtype=np.float64)
-    V = np.asarray(ds_parcels["V"].values, dtype=np.float64)
-
-    dUdt = np.gradient(U, float(dt), axis=0, edge_order=1)
-    dVdt = np.gradient(V, float(dt), axis=0, edge_order=1)
-
-    dUdy, dUdx = np.gradient(U, float(dy), float(dx), axis=(-2, -1), edge_order=1)
-    dVdy, dVdx = np.gradient(V, float(dy), float(dx), axis=(-2, -1), edge_order=1)
+    U = np.asarray(ds_parcels["U"].values, dtype=np.float32)
+    V = np.asarray(ds_parcels["V"].values, dtype=np.float32)
 
     dims = ("time", "y", "x")
-    coords = {"time": ds_parcels["time"], "y": ds_parcels["y"], "x": ds_parcels["x"]}
+    coords = {
+        "time": ds_parcels["time"],
+        "y": ds_parcels["y"],
+        "x": ds_parcels["x"],
+    }
 
-    ds_parcels["dUdt"] = xr.DataArray(dUdt.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdt"] = xr.DataArray(dVdt.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dUdx"] = xr.DataArray(dUdx.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dUdy"] = xr.DataArray(dUdy.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdx"] = xr.DataArray(dVdx.astype(np.float32), dims=dims, coords=coords)
-    ds_parcels["dVdy"] = xr.DataArray(dVdy.astype(np.float32), dims=dims, coords=coords)
+    ds_parcels["dUdt"] = xr.DataArray(
+        _gradient_axis_float32(U, dt, axis=0),
+        dims=dims,
+        coords=coords,
+    )
+    ds_parcels["dVdt"] = xr.DataArray(
+        _gradient_axis_float32(V, dt, axis=0),
+        dims=dims,
+        coords=coords,
+    )
+
+    ds_parcels["dUdx"] = xr.DataArray(
+        _gradient_axis_float32(U, dx, axis=2),
+        dims=dims,
+        coords=coords,
+    )
+    ds_parcels["dUdy"] = xr.DataArray(
+        _gradient_axis_float32(U, dy, axis=1),
+        dims=dims,
+        coords=coords,
+    )
+
+    ds_parcels["dVdx"] = xr.DataArray(
+        _gradient_axis_float32(V, dx, axis=2),
+        dims=dims,
+        coords=coords,
+    )
+    ds_parcels["dVdy"] = xr.DataArray(
+        _gradient_axis_float32(V, dy, axis=1),
+        dims=dims,
+        coords=coords,
+    )
 
     ds_parcels["dUdt"].attrs.update(units="m s-2", long_name="time derivative of U")
     ds_parcels["dVdt"].attrs.update(units="m s-2", long_name="time derivative of V")
+
     for name in ["dUdx", "dUdy", "dVdx", "dVdy"]:
         ds_parcels[name].attrs.update(units="s-1", long_name=name)
 
@@ -159,6 +244,7 @@ def _add_velocity_derivative_fields(
     ds_parcels.attrs["dt_s"] = float(dt)
 
     return ds_parcels
+
 
 
 def mitgcm_cgrid_to_parcels_dataset(
