@@ -129,7 +129,10 @@ def _is_glorys(ds):
 
 
 def _is_mitgcm(ds):
-    return ("U" in ds.data_vars) and ("V" in ds.data_vars)
+    return (
+        ("U" in ds.data_vars and "V" in ds.data_vars)
+        or ("UVEL" in ds.data_vars and "VVEL" in ds.data_vars)
+    )
 
 
 def _center_mitgcm_u(u):
@@ -157,6 +160,11 @@ def _extract_surface_uv_xy(ds):
       dims       : tuple of native horizontal dim names
       coords     : dict for xarray output
       grid_type  : 'glorys' or 'mitgcm'
+
+    Supported:
+    - GLORYS: uo/vo on latitude/longitude
+    - MITgcm custom: U/V on T,Z,Y,Xp1 / T,Z,Yp1,X
+    - MITgcm diagnostics: UVEL/VVEL on T,Zmd...,Y,Xp1 / T,Zmd...,Yp1,X
     """
     if _is_glorys(ds):
         lon_dim = "longitude" if "longitude" in ds.dims else "lon"
@@ -195,19 +203,35 @@ def _extract_surface_uv_xy(ds):
         return u, v, X, Y, lon, lat, (lat_dim, lon_dim), coords, "glorys"
 
     if _is_mitgcm(ds):
-        u_da = ds["U"]
-        v_da = ds["V"]
+        # Support both naming conventions
+        if "U" in ds.data_vars and "V" in ds.data_vars:
+            u_name = "U"
+            v_name = "V"
+        else:
+            u_name = "UVEL"
+            v_name = "VVEL"
 
+        u_da = ds[u_name]
+        v_da = ds[v_name]
+
+        # Select first time index
         if "T" in u_da.dims:
             u_da = u_da.isel(T=0)
+        if "T" in v_da.dims:
             v_da = v_da.isel(T=0)
 
-        if "Z" in u_da.dims:
-            u_da = u_da.isel(Z=0)
-            v_da = v_da.isel(Z=0)
+        # Select first vertical level.
+        # Handles Z, Zmd000061, Zmd000001, etc.
+        u_z_dims = [d for d in u_da.dims if d.startswith("Z") or d.lower().startswith("z")]
+        v_z_dims = [d for d in v_da.dims if d.startswith("Z") or d.lower().startswith("z")]
 
-        u_raw = u_da.values.astype(float)  # (Y, Xp1)
-        v_raw = v_da.values.astype(float)  # (Yp1, X)
+        if len(u_z_dims) > 0:
+            u_da = u_da.isel({u_z_dims[0]: 0})
+        if len(v_z_dims) > 0:
+            v_da = v_da.isel({v_z_dims[0]: 0})
+
+        u_raw = u_da.values.astype(float)  # expected (Y, Xp1)
+        v_raw = v_da.values.astype(float)  # expected (Yp1, X)
 
         u = _center_mitgcm_u(u_raw)
         v = _center_mitgcm_v(v_raw)
@@ -227,8 +251,9 @@ def _extract_surface_uv_xy(ds):
 
     raise ValueError(
         "Could not detect dataset type. Expected GLORYS variables uo/vo "
-        "or MITgcm variables U/V."
+        "or MITgcm variables U/V or UVEL/VVEL."
     )
+
 
 def _apply_consistent_style():
     """Apply the shared thesis style and enforce a white background."""
