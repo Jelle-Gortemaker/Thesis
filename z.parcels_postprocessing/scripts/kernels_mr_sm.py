@@ -10,16 +10,22 @@ import math
 
 def advection_mr_sm_rk4(particle, fieldset, time):
     """
-    Slow-manifold inertial advection using a manually prescribed effective
-    response time tau_p.
+    Simplified tau-only inertial advection without explicit Coriolis.
 
-    The effective particle velocity is:
+    Effective particle velocity:
 
-        u_p = U + tau_p * (DU/Dt - f0 V)
-        v_p = V + tau_p * (DV/Dt + f0 U)
+        u_p = U + tau_p * DU/Dt
+        v_p = V + tau_p * DV/Dt
 
-    Here tau_p is supplied directly by the user. Diameter, buoyancy,
-    viscosity, Rep, and drag corrections are not used by default.
+    where:
+
+        DU/Dt = dUdt + U*dUdx + V*dUdy
+        DV/Dt = dVdt + U*dVdx + V*dVdy
+
+    tau_p is prescribed directly by the user.
+
+    Diameter, buoyancy, viscosity, drag correction, Rep, and explicit Coriolis
+    are not used in this simplified model.
     """
 
     tau = particle.tau_p
@@ -40,8 +46,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt1 = dudt1 + uf1 * dudx1 + vf1 * dudy1
     DvDt1 = dvdt1 + uf1 * dvdx1 + vf1 * dvdy1
 
-    u1 = uf1 + tau * (DuDt1 - fieldset.f0 * vf1)
-    v1 = vf1 + tau * (DvDt1 + fieldset.f0 * uf1)
+    u1 = uf1 + tau * DuDt1
+    v1 = vf1 + tau * DvDt1
 
     lon1 = particle.lon + 0.5 * particle.dt * u1
     lat1 = particle.lat + 0.5 * particle.dt * v1
@@ -63,8 +69,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt2 = dudt2 + uf2 * dudx2 + vf2 * dudy2
     DvDt2 = dvdt2 + uf2 * dvdx2 + vf2 * dvdy2
 
-    u2 = uf2 + tau * (DuDt2 - fieldset.f0 * vf2)
-    v2 = vf2 + tau * (DvDt2 + fieldset.f0 * uf2)
+    u2 = uf2 + tau * DuDt2
+    v2 = vf2 + tau * DvDt2
 
     lon2 = particle.lon + 0.5 * particle.dt * u2
     lat2 = particle.lat + 0.5 * particle.dt * v2
@@ -86,8 +92,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt3 = dudt3 + uf3 * dudx3 + vf3 * dudy3
     DvDt3 = dvdt3 + uf3 * dvdx3 + vf3 * dvdy3
 
-    u3 = uf3 + tau * (DuDt3 - fieldset.f0 * vf3)
-    v3 = vf3 + tau * (DvDt3 + fieldset.f0 * uf3)
+    u3 = uf3 + tau * DuDt3
+    v3 = vf3 + tau * DvDt3
 
     lon3 = particle.lon + particle.dt * u3
     lat3 = particle.lat + particle.dt * v3
@@ -109,8 +115,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt4 = dudt4 + uf4 * dudx4 + vf4 * dudy4
     DvDt4 = dvdt4 + uf4 * dvdx4 + vf4 * dvdy4
 
-    u4 = uf4 + tau * (DuDt4 - fieldset.f0 * vf4)
-    v4 = vf4 + tau * (DvDt4 + fieldset.f0 * uf4)
+    u4 = uf4 + tau * DuDt4
+    v4 = vf4 + tau * DvDt4
 
     # ============================================================
     # Final RK4 update and diagnostics

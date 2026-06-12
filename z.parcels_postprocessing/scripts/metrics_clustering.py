@@ -513,25 +513,39 @@ def compute_voronoi_pdf_aggregate(
     area_norm_all = np.concatenate(all_area_norm)
 
     if bins is None:
-        bins = np.logspace(-2, 1.2, 70)   # good default for Monchaux-style plots
+        bins = np.logspace(-2.0, 1.2, 60)
 
-    hist, edges = np.histogram(area_norm_all, bins=bins, density=True)
-    centers = np.sqrt(edges[:-1] * edges[1:])   # geometric centers for log bins
+    count, edges = np.histogram(area_norm_all, bins=bins, density=False)
+    pdf, _ = np.histogram(area_norm_all, bins=bins, density=True)
 
+    centers = np.sqrt(edges[:-1] * edges[1:])
     pdf_ref = poisson_voronoi_area_pdf_2d(centers)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        relative_pdf = hist / pdf_ref
+        relative_pdf = pdf / pdf_ref
     relative_pdf[~np.isfinite(relative_pdf)] = np.nan
 
-    nu_c = find_first_pdf_intersection(centers, hist, pdf_ref)
-    nu_v = find_second_pdf_intersection(centers, hist, pdf_ref)
+    min_count_for_threshold = 5
+    valid_for_threshold = count >= min_count_for_threshold
+
+    nu_c = find_first_pdf_intersection(
+        centers[valid_for_threshold],
+        pdf[valid_for_threshold],
+        pdf_ref[valid_for_threshold],
+    )
+
+    nu_v = find_second_pdf_intersection(
+        centers[valid_for_threshold],
+        pdf[valid_for_threshold],
+        pdf_ref[valid_for_threshold],
+    )
 
     return xr.Dataset(
         data_vars={
-            "pdf": ("bin", hist.astype(float)),
+            "pdf": ("bin", pdf.astype(float)),
             "pdf_poisson": ("bin", pdf_ref.astype(float)),
             "relative_pdf": ("bin", relative_pdf.astype(float)),
+            "count": ("bin", count.astype(int)),
             "cluster_threshold_nu_c": xr.DataArray(float(nu_c)),
             "void_threshold_nu_v": xr.DataArray(float(nu_v)),
             "n_samples": xr.DataArray(int(area_norm_all.size)),
@@ -545,6 +559,7 @@ def compute_voronoi_pdf_aggregate(
         attrs={
             "description": "Aggregate Monchaux-style Voronoi area PDF in nu=A/<A>.",
             "n_obs_aggregated": int(len(obs_indices)),
+            "min_count_for_threshold": int(min_count_for_threshold),
         },
     )
 
@@ -555,6 +570,7 @@ def plot_voronoi_pdf_monchaux(
     particle_label: str = "particles",
     color="tab:blue",
     title_prefix: str | None = None,
+    min_count: int = 5,
 ):
     """
     Monchaux-style two-panel Voronoï PDF figure.
@@ -563,7 +579,7 @@ def plot_voronoi_pdf_monchaux(
     Panel (b): relative PDF = PDF / PDF_poisson
     """
     if axes is None:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), facecolor="white")
+        fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.8), facecolor="white")
     else:
         fig = axes[0].figure
 
@@ -574,45 +590,74 @@ def plot_voronoi_pdf_monchaux(
     pdf_ref = np.asarray(pdf_ds["pdf_poisson"].values, dtype=float)
     rel = np.asarray(pdf_ds["relative_pdf"].values, dtype=float)
 
+    if "count" in pdf_ds:
+        count = np.asarray(pdf_ds["count"].values, dtype=float)
+    else:
+        count = np.ones_like(nu)
+
     nu_c = float(pdf_ds["cluster_threshold_nu_c"].values)
     nu_v = float(pdf_ds["void_threshold_nu_v"].values)
 
-    pdf_plot = np.where(pdf > 0, pdf, np.nan)
-    ref_plot = np.where(pdf_ref > 0, pdf_ref, np.nan)
-    rel_plot = np.where(rel > 0, rel, np.nan)
+    valid_particle = (
+        np.isfinite(nu)
+        & np.isfinite(pdf)
+        & np.isfinite(pdf_ref)
+        & np.isfinite(rel)
+        & (nu > 0.0)
+        & (pdf > 0.0)
+        & (pdf_ref > 0.0)
+        & (count >= min_count)
+    )
 
-    # Panel (a)
+    valid_ref = (
+        np.isfinite(nu)
+        & np.isfinite(pdf_ref)
+        & (nu > 0.0)
+        & (pdf_ref > 0.0)
+    )
+
+    pdf_plot = np.where(valid_particle, pdf, np.nan)
+    ref_plot = np.where(valid_ref, pdf_ref, np.nan)
+    rel_plot = np.where(valid_particle & (rel > 0.0), rel, np.nan)
+
     ax1.plot(nu, pdf_plot, color=color, lw=2.0, label=particle_label)
-    ax1.plot(nu, ref_plot, color="0.25", lw=1.5, ls="--", label="Poisson")
+    ax1.plot(nu, ref_plot, color="0.25", lw=1.4, ls="--", label="Poisson")
+
     ax1.set_xscale("log")
     ax1.set_yscale("log")
-    ax1.set_xlabel(r"$\nu$")
+    ax1.set_xlim(1e-2, 2e1)
+    ax1.set_ylim(1e-4, 2e0)
+
+    ax1.set_xlabel(r"$\nu=A/\langle A\rangle$")
     ax1.set_ylabel("PDF")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    ax1.grid(True, alpha=0.25)
+    ax1.legend(loc="best")
 
-    # Panel (b)
-    ax2.plot(nu, rel_plot, color="0.35", lw=2.0)
+    ax2.plot(nu, rel_plot, color="0.35", lw=1.8)
     ax2.axhline(1.0, color="0.15", lw=1.0, ls="-.")
-    if np.isfinite(nu_c):
-        ax2.axvline(nu_c, color="0.35", lw=1.0, ls=":")
-        ax2.text(nu_c, 70, r"$\nu_c$", ha="center", va="bottom")
-    if np.isfinite(nu_v):
-        ax2.axvline(nu_v, color="0.35", lw=1.0, ls=":")
-        ax2.text(nu_v, 70, r"$\nu_v$", ha="center", va="bottom")
+
+    xmin, xmax = 1e-2, 2e1
 
     if np.isfinite(nu_c):
-        ax2.axvspan(nu.min(), nu_c, color="0.3", alpha=0.25)
-        ax2.text(max(nu.min() * 1.8, 0.02), 20, "Clusters", color="white")
+        ax2.axvline(nu_c, color="0.2", lw=1.0, ls=":")
+        ax2.axvspan(xmin, nu_c, color="0.35", alpha=0.25)
+        ax2.text(nu_c, 70.0, r"$\nu_c$", ha="center", va="bottom")
+        ax2.text(1.7e-2, 20.0, "Clusters", color="white")
+
     if np.isfinite(nu_v):
-        ax2.axvspan(nu_v, nu.max(), color="0.7", alpha=0.25)
-        ax2.text(nu_v * 1.25, 20, "Voids", color="0.2")
+        ax2.axvline(nu_v, color="0.2", lw=1.0, ls=":")
+        ax2.axvspan(nu_v, xmax, color="0.75", alpha=0.35)
+        ax2.text(nu_v, 70.0, r"$\nu_v$", ha="center", va="bottom")
+        ax2.text(max(nu_v * 1.2, 2.0), 20.0, "Voids", color="0.2")
 
     ax2.set_xscale("log")
     ax2.set_yscale("log")
-    ax2.set_xlabel(r"$\nu$")
+    ax2.set_xlim(xmin, xmax)
+    ax2.set_ylim(1e-1, 1e2)
+
+    ax2.set_xlabel(r"$\nu=A/\langle A\rangle$")
     ax2.set_ylabel("relative PDF")
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.25)
 
     if title_prefix is not None:
         fig.suptitle(title_prefix)

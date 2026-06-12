@@ -362,9 +362,6 @@ def run_parcels_experiment(config: RunConfig) -> dict:
 
     params = particle_class_parameters(config)
 
-    if config.particle_class == "mr_sm":
-        fieldset.add_constant("f0", float(config.f0))
-
     lon0, lat0 = prepare_release(config, ds)
 
     release_time = _get_release_time(fieldset, config.release_time_index)
