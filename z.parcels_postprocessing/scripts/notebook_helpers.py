@@ -70,24 +70,97 @@ def resolve_obs_index(selection, n_obs: int) -> int:
 
     return selection
 
+def load_ett_flow_timescale(
+    ett_json: str | Path,
+    *,
+    multiplier: float = 0.5,
+) -> dict[str, Any]:
+    """
+    Read an ETT metadata JSON and return the selected flow timescale.
+
+    The expected JSON entry is:
+        eddy_turnover_time_days -> median_T_eddy_days
+
+    The selected flow timescale is:
+        multiplier * median_T_eddy_days
+    """
+    ett_json = Path(ett_json)
+
+    if not ett_json.exists():
+        raise FileNotFoundError(f"Could not find ETT metadata file:\n{ett_json}")
+
+    if multiplier <= 0.0:
+        raise ValueError("multiplier must be positive.")
+
+    with open(ett_json, "r") as f:
+        metadata = json.load(f)
+
+    try:
+        median_days = float(
+            metadata["eddy_turnover_time_days"]["median_T_eddy_days"]
+        )
+    except KeyError as exc:
+        raise KeyError(
+            "Expected ETT JSON entry: "
+            "eddy_turnover_time_days -> median_T_eddy_days"
+        ) from exc
+
+    flow_days = float(multiplier) * median_days
+
+    return {
+        "ett_json": ett_json,
+        "metadata": metadata,
+        "median_eddy_turnover_days": median_days,
+        "multiplier": float(multiplier),
+        "flow_timescale_days": flow_days,
+        "flow_timescale_seconds": flow_days * 86400.0,
+    }
+
 
 # ============================================================
 # PARTICLE / TRAJECTORY DATA HELPERS
 # ============================================================
 
-def _safe_number(x: float, precision: int = 4) -> str:
-    if x is None:
-        return "none"
-    if not np.isfinite(float(x)):
-        return "nan"
-    s = f"{float(x):.{precision}g}"
-    return s.replace("-", "m").replace("+", "").replace(".", "p")
+
+def _tau_value_and_unit(tau_seconds: float) -> tuple[float, str]:
+    """Return a compact numerical value and unit for tau_p."""
+    tau_seconds = float(tau_seconds)
+
+    if tau_seconds <= 0.0:
+        return 0.0, "s"
+
+    days = tau_seconds / 86400.0
+    if np.isclose(days, round(days)):
+        return float(round(days)), "d"
+
+    hours = tau_seconds / 3600.0
+    if np.isclose(hours, round(hours)):
+        return float(round(hours)), "h"
+
+    minutes = tau_seconds / 60.0
+    if np.isclose(minutes, round(minutes)):
+        return float(round(minutes)), "min"
+
+    return tau_seconds, "s"
 
 
-def stokes_relaxation_time_seconds(B: float, diameter_m: float, nu_m2_s: float) -> float:
-    """Stokes relaxation time used by the slow-manifold MR model."""
-    return float(diameter_m) ** 2 * (1.0 + 2.0 * float(B)) / (36.0 * float(nu_m2_s))
+def _tau_tag(tau_seconds: float) -> str:
+    """
+    Compact file-safe tag containing only tau_p.
 
+    Examples:
+        600 s   -> tau10min
+        3600 s  -> tau1h
+        43200 s -> tau12h
+    """
+    value, unit = _tau_value_and_unit(tau_seconds)
+    value_txt = f"{value:g}".replace("-", "m").replace(".", "p")
+    return f"tau{value_txt}{unit}"
+
+
+def _tau_display_text(tau_seconds: float) -> str:
+    value, unit = _tau_value_and_unit(tau_seconds)
+    return f"{value:g} {unit}"
 
 def build_particle_specs(
     tau_p_seconds_list: Iterable[float] | None = None,
@@ -96,71 +169,79 @@ def build_particle_specs(
     flow_timescale_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Build particle specs using tau_p directly.
+    Build particle specifications using prescribed effective tau_p values.
 
-    tau_p_seconds is the only particle-control parameter for MR-SM particles.
+    Particle tags contain only tau_p. Display labels contain tau_p and the
+    automatically calculated effective Stokes number:
+
+        St = tau_p / flow_timescale_seconds
     """
     specs: list[dict[str, Any]] = []
 
+    if flow_timescale_seconds is not None:
+        flow_timescale_seconds = float(flow_timescale_seconds)
+
+        if flow_timescale_seconds <= 0.0:
+            raise ValueError("flow_timescale_seconds must be positive.")
+
     if include_passive:
-        specs.append({
-            "particle_class": "passive",
-            "tag": "passive",
-            "label": "Tracer",
-            "tau_p_seconds": 0.0,
-            "tau_s_seconds": 0.0,
-            "tau_eff_nominal_seconds": 0.0,
-            "stokes_number": 0.0,
-            "flow_timescale_seconds": flow_timescale_seconds,
-        })
+        specs.append(
+            {
+                "particle_class": "passive",
+                "tag": "passive",
+                "label": "Passive particles",
+                "tau_p_seconds": 0.0,
+                "stokes_number": 0.0,
+                "flow_timescale_seconds": flow_timescale_seconds,
+            }
+        )
 
     if tau_p_seconds_list is None:
         tau_p_seconds_list = []
 
-    for tau_p in tau_p_seconds_list:
-        tau_p = float(tau_p)
+    for tau_p_seconds in tau_p_seconds_list:
+        tau_p_seconds = float(tau_p_seconds)
 
-        if tau_p <= 0.0:
-            raise ValueError("All tau_p_seconds values must be positive.")
+        if tau_p_seconds <= 0.0:
+            raise ValueError(
+                "Every MR-SM tau_p_seconds value must be positive."
+            )
 
         if flow_timescale_seconds is None:
             stokes_number = np.nan
         else:
-            stokes_number = tau_p / float(flow_timescale_seconds)
+            stokes_number = tau_p_seconds / flow_timescale_seconds
 
-        tau_h = tau_p / 3600.0
-
-        tag = (
-            f"mrsm_tau{_safe_number(tau_p)}s_"
-            f"St{_safe_number(stokes_number)}"
-        )
+        tau_txt = _tau_display_text(tau_p_seconds)
+        tag = _tau_tag(tau_p_seconds)
 
         if np.isfinite(stokes_number):
-            label = f"tau={tau_h:g} h, St={stokes_number:.3g}"
+            label = f"τₚ={tau_txt}, St={stokes_number:.3g}"
         else:
-            label = f"tau={tau_h:g} h"
+            label = f"τₚ={tau_txt}"
 
-        specs.append({
-            "particle_class": "mr_sm",
-            "tag": tag,
-            "label": label,
-            "tau_p_seconds": tau_p,
-            "tau_s_seconds": tau_p,
-            "tau_eff_nominal_seconds": tau_p,
-            "stokes_number": stokes_number,
-            "flow_timescale_seconds": flow_timescale_seconds,
-        })
+        specs.append(
+            {
+                "particle_class": "mr_sm",
+                "tag": tag,
+                "label": label,
+                "tau_p_seconds": tau_p_seconds,
+                "stokes_number": stokes_number,
+                "flow_timescale_seconds": flow_timescale_seconds,
+            }
+        )
 
     return specs
 
 
 def print_particle_specs(particle_specs: list[dict[str, Any]]) -> None:
-    print("Particle classes:")
+    print("\nParticle classes")
+
     for spec in particle_specs:
         print(
-            f"  {spec['tag']} | {spec['label']} | "
-            f"tau_p={spec.get('tau_p_seconds')} s | "
-            f"St={spec.get('stokes_number')}"
+            f"  {spec['tag']} | "
+            f"{spec['label']} | "
+            f"tau_p={spec['tau_p_seconds']:.6g} s"
         )
 
 def get_xy_names(ds: xr.Dataset) -> tuple[str, str]:
@@ -191,17 +272,22 @@ def get_release_ids(ds: xr.Dataset) -> np.ndarray:
 
 
 def get_common_release_ids(trajectories: dict) -> np.ndarray:
-    common_ids = None
+    """Return release IDs shared by all selected particle classes."""
+    if not trajectories:
+        return np.array([], dtype=int)
+
+    common_ids: set[int] | None = None
 
     for item in trajectories.values():
         release_ids = get_release_ids(item["ds"])
+        release_id_set = set(release_ids.tolist())
 
         if common_ids is None:
-            common_ids = set(release_ids.tolist())
+            common_ids = release_id_set
         else:
-            common_ids = common_ids.intersection(set(release_ids.tolist()))
+            common_ids &= release_id_set
 
-    return np.array(sorted(common_ids), dtype=int)
+    return np.asarray(sorted(common_ids or []), dtype=int)
 
 
 def get_periodic_domain_lengths(ds_parcels: xr.Dataset) -> tuple[float, float]:
@@ -272,18 +358,25 @@ def get_elapsed_time_days(ds: xr.Dataset, obs_index: int) -> float:
 
 
 def build_class_style_map(trajectories: dict) -> dict:
-    """
-    Build a consistent color/marker map for each particle class.
-    """
+    """Build a consistent color/marker map for each particle class."""
     particle_tags = list(trajectories.keys())
 
     if hasattr(ptheme, "get_class_style"):
         return {
-            tag: {
-                **ptheme.get_class_style(i, label=trajectories[tag].get("display_label", trajectories[tag].get("label", tag))),
-                "label": trajectories[tag].get("display_label", trajectories[tag].get("label", tag)),
+            particle_tag: {
+                **ptheme.get_class_style(
+                    i,
+                    label=trajectories[particle_tag].get(
+                        "display_label",
+                        trajectories[particle_tag].get("label", particle_tag),
+                    ),
+                ),
+                "label": trajectories[particle_tag].get(
+                    "display_label",
+                    trajectories[particle_tag].get("label", particle_tag),
+                ),
             }
-            for i, tag in enumerate(particle_tags)
+            for i, particle_tag in enumerate(particle_tags)
         }
 
     cmap = plt.get_cmap(getattr(ptheme, "CLASS_COLORMAP", "tab10"))
@@ -298,7 +391,10 @@ def build_class_style_map(trajectories: dict) -> dict:
     for i, particle_tag in enumerate(particle_tags):
         item = trajectories[particle_tag]
         style_map[particle_tag] = {
-            "label": item.get("display_label", item.get("label", tag)),
+            "label": item.get(
+                "display_label",
+                item.get("label", particle_tag),
+            ),
             "color": cmap(i % cmap.N),
             "marker": marker_cycle[i % len(marker_cycle)],
         }
@@ -311,9 +407,7 @@ def load_trajectory_collection(
     load_if_temporary: bool,
     loader,
 ) -> dict:
-    """
-    Load trajectories from run_outputs into the notebook's trajectory dictionary format.
-    """
+    """Load trajectories from a run_outputs dictionary."""
     trajectories = {}
 
     for particle_tag, item in run_outputs.items():
@@ -322,16 +416,27 @@ def load_trajectory_collection(
         if load_if_temporary:
             ds_traj = ds_traj.load()
 
+        info = item.get("info", {}) or {}
+        spec = item.get("spec", {}) or {}
+        label = (
+            item.get("display_label")
+            or item.get("label")
+            or info.get("particle_label")
+            or spec.get("label")
+            or particle_tag
+        )
+
         trajectories[particle_tag] = {
             "ds": ds_traj,
-            "label": item.get("display_label", item.get("label", tag)),
-            "path": item["path"],
-            "info": item["info"],
-            "spec": item["spec"],
+            "label": label,
+            "display_label": label,
+            "path": Path(item["path"]),
+            "info": info,
+            "spec": spec,
         }
 
         print(f"\nTrajectory QC: {particle_tag}")
-        print(f"  label     : {item['label']}")
+        print(f"  label     : {label}")
         print(f"  path      : {item['path']}")
         print(f"  dims      : {dict(ds_traj.sizes)}")
         print(f"  variables : {list(ds_traj.data_vars)}")
@@ -352,41 +457,15 @@ def load_trajectory_collection_from_config(
     loader,
     load: bool = False,
 ) -> tuple[dict, dict]:
-    """
-    Load saved trajectory files using the run-collection config JSON.
-
-    Returns
-    -------
-    trajectories, config
-    """
+    """Load saved trajectories and their collection metadata."""
     config = load_collection_config(config_json)
     run_outputs = config.get("run_outputs", {})
 
-    trajectories = {}
-    for particle_tag, item in run_outputs.items():
-        path = Path(item["path"])
-        ds_traj = loader(path)
-        if load:
-            ds_traj = ds_traj.load()
-
-        info = item.get("info", {})
-        spec = item.get("spec", {})
-        label = item.get("label") or info.get("particle_label") or spec.get("label") or particle_tag
-
-        trajectories[particle_tag] = {
-            "ds": ds_traj,
-            "label": label,
-            "display_label": item.get("display_label", label),
-            "path": path,
-            "info": info,
-            "spec": spec,
-        }
-
-        print(f"\nTrajectory QC: {particle_tag}")
-        print(f"  label     : {label}")
-        print(f"  path      : {path}")
-        print(f"  dims      : {dict(ds_traj.sizes)}")
-        print(f"  variables : {list(ds_traj.data_vars)}")
+    trajectories = load_trajectory_collection(
+        run_outputs,
+        load_if_temporary=load,
+        loader=loader,
+    )
 
     return trajectories, config
 
@@ -397,60 +476,77 @@ def filter_trajectories(
     include_tags: Iterable[str] | None = None,
     include_particle_classes: Iterable[str] | None = None,
     stokes_range: tuple[float | None, float | None] | None = None,
-    diameter_range_m: tuple[float | None, float | None] | None = None,
-    drag_corrections: Iterable[str] | None = None,
+    tau_p_range_seconds: tuple[float | None, float | None] | None = None,
 ) -> dict:
     """
-    Select a subset of trajectory classes using stored metadata.
+    Select trajectory classes using tau-only particle metadata.
 
-    This is useful in the analysis notebook when you only want, for example,
-    passive tracers and MR-SM particles with a certain diameter/Stokes number.
+    Parameters
+    ----------
+    include_tags
+        Exact particle tags to retain.
+    include_particle_classes
+        Particle classes to retain, e.g. ``passive`` and ``mr_sm``.
+    stokes_range
+        Inclusive range for St = tau_p / flow_timescale.
+    tau_p_range_seconds
+        Inclusive range for prescribed tau_p in seconds.
     """
     include_tags = None if include_tags is None else set(include_tags)
     include_particle_classes = (
-        None if include_particle_classes is None else set(include_particle_classes)
+        None
+        if include_particle_classes is None
+        else set(include_particle_classes)
     )
-    drag_corrections = None if drag_corrections is None else set(drag_corrections)
 
     selected = {}
 
-    for tag, item in trajectories.items():
+    for particle_tag, item in trajectories.items():
         info = item.get("info", {}) or {}
         spec = item.get("spec", {}) or {}
 
-        particle_class = info.get("particle_class", spec.get("particle_class"))
-        st = info.get("stokes_number", spec.get("stokes_number"))
-        diameter = info.get("diameter_m", spec.get("diameter_m"))
-        drag = info.get("drag_correction", spec.get("drag_correction"))
+        particle_class = info.get(
+            "particle_class",
+            spec.get("particle_class"),
+        )
+        tau_p = info.get(
+            "tau_p_seconds",
+            spec.get("tau_p_seconds"),
+        )
+        stokes_number = _effective_stokes_number(info, spec)
 
-        if include_tags is not None and tag not in include_tags:
+        if include_tags is not None and particle_tag not in include_tags:
             continue
 
-        if include_particle_classes is not None and particle_class not in include_particle_classes:
+        if (
+            include_particle_classes is not None
+            and particle_class not in include_particle_classes
+        ):
             continue
 
-        if drag_corrections is not None and drag not in drag_corrections:
-            continue
-
-        if stokes_range is not None and st is not None and np.isfinite(float(st)):
+        if stokes_range is not None and np.isfinite(stokes_number):
             st_min, st_max = stokes_range
-            if st_min is not None and float(st) < st_min:
+            if st_min is not None and stokes_number < st_min:
                 continue
-            if st_max is not None and float(st) > st_max:
-                continue
-
-        if diameter_range_m is not None and diameter is not None and np.isfinite(float(diameter)):
-            d_min, d_max = diameter_range_m
-            if d_min is not None and float(diameter) < d_min:
-                continue
-            if d_max is not None and float(diameter) > d_max:
+            if st_max is not None and stokes_number > st_max:
                 continue
 
-        selected[tag] = item
+        if tau_p_range_seconds is not None and tau_p is not None:
+            tau_p = float(tau_p)
+            tau_min, tau_max = tau_p_range_seconds
+            if tau_min is not None and tau_p < tau_min:
+                continue
+            if tau_max is not None and tau_p > tau_max:
+                continue
+
+        selected[particle_tag] = item
 
     print("Selected particle classes:")
-    for tag, item in selected.items():
-        print(f"  {tag} | {item.get('display_label', item.get('label', tag))}")
+    for particle_tag, item in selected.items():
+        print(
+            f"  {particle_tag} | "
+            f"{item.get('display_label', item.get('label', particle_tag))}"
+        )
 
     return selected
 
@@ -600,7 +696,7 @@ def plot_trajectory_subset_per_class(
             )
 
         _format_xy_axis(ax)
-        ax.set_title(f"Trajectories random subset of n={n_plot}, case {run_title_info}")
+        ax.set_title(f"{run_title_info} | n={n_plot}/{len(common_release_ids)}")
         ax.legend(loc="upper right")
         fig.tight_layout()
 
@@ -778,34 +874,69 @@ def plot_position_snapshots_per_class(
 # METADATA / LABEL HELPERS
 # ============================================================
 
-def compact_particle_label(info: dict | None = None, spec: dict | None = None) -> str:
-    """
-    Build a deliberately short display label from stored metadata.
+def _effective_stokes_number(info: dict, spec: dict) -> float:
+    """Calculate St from tau_p and flow timescale, with metadata fallback."""
+    tau_p = info.get("tau_p_seconds", spec.get("tau_p_seconds"))
+    flow_timescale = info.get(
+        "flow_timescale_seconds",
+        spec.get("flow_timescale_seconds"),
+    )
 
-    This affects only plot legends. Full characteristics remain available in
-    the metadata dictionary and sidecar JSON file.
-    """
+    try:
+        tau_p = float(tau_p)
+        flow_timescale = float(flow_timescale)
+        if tau_p >= 0.0 and flow_timescale > 0.0:
+            return tau_p / flow_timescale
+    except (TypeError, ValueError):
+        pass
+
+    stored = info.get("stokes_number", spec.get("stokes_number", np.nan))
+
+    try:
+        return float(stored)
+    except (TypeError, ValueError):
+        return np.nan
+
+def compact_particle_label(
+    info: dict | None = None,
+    spec: dict | None = None,
+) -> str:
+    """Build a compact label from tau_p and effective Stokes number."""
     info = info or {}
     spec = spec or {}
-    particle_class = info.get("particle_class", spec.get("particle_class", ""))
+
+    particle_class = info.get(
+        "particle_class",
+        spec.get("particle_class", ""),
+    )
 
     if particle_class == "passive":
-        return "Tracer"
+        return "Passive particles"
 
     if particle_class == "mr_sm":
-        d = info.get("diameter_m", spec.get("diameter_m", np.nan))
-        st = info.get("stokes_number", spec.get("stokes_number", np.nan))
-        try:
-            d_txt = f"{float(d):g} m"
-        except Exception:
-            d_txt = "d=?"
-        try:
-            st_txt = "nan" if not np.isfinite(float(st)) else f"{float(st):.3g}"
-        except Exception:
-            st_txt = "?"
-        return f"MR-SM d={d_txt}, St={st_txt}"
+        tau_p_seconds = info.get(
+            "tau_p_seconds",
+            spec.get("tau_p_seconds"),
+        )
 
-    return str(info.get("particle_label", spec.get("label", particle_class or "particle")))
+        try:
+            tau_txt = _tau_display_text(float(tau_p_seconds))
+        except (TypeError, ValueError):
+            tau_txt = "?"
+
+        stokes_number = _effective_stokes_number(info, spec)
+
+        if np.isfinite(stokes_number):
+            return f"τₚ={tau_txt}, St={stokes_number:.3g}"
+
+        return f"τₚ={tau_txt}"
+
+    return str(
+        info.get(
+            "particle_label",
+            spec.get("label", particle_class or "particle"),
+        )
+    )
 
 
 def apply_label_overrides(trajectories: dict, label_overrides: dict[str, str] | None = None) -> dict:
@@ -835,30 +966,36 @@ def apply_label_overrides(trajectories: dict, label_overrides: dict[str, str] | 
 
 
 def particle_metadata_table(trajectories: dict) -> pd.DataFrame:
-    """Return a compact table of particle metadata for filtering/plot labelling."""
+    """Return a compact tau-only particle metadata table."""
     rows = []
-    keys = [
-        "particle_class",
-        "particle_label",
-        "B",
-        "diameter_m",
-        "tau_s_seconds",
-        "tau_eff_nominal_seconds",
-        "stokes_number",
-        "drag_correction",
-        "C_Rep",
-        "Rep_max",
-        "metadata_path",
-        "output_path",
-    ]
 
-    for tag, item in trajectories.items():
+    for particle_tag, item in trajectories.items():
         info = item.get("info", {}) or {}
         spec = item.get("spec", {}) or {}
-        row = {"particle_tag": tag, "display_label": item.get("display_label", item.get("label", tag))}
-        for key in keys:
-            row[key] = info.get(key, spec.get(key, None))
-        rows.append(row)
+
+        tau_p = info.get("tau_p_seconds", spec.get("tau_p_seconds"))
+        flow_timescale = info.get(
+            "flow_timescale_seconds",
+            spec.get("flow_timescale_seconds"),
+        )
+
+        rows.append(
+            {
+                "particle_tag": particle_tag,
+                "display_label": item.get(
+                    "display_label",
+                    item.get("label", particle_tag),
+                ),
+                "particle_class": info.get(
+                    "particle_class",
+                    spec.get("particle_class"),
+                ),
+                "tau_p_seconds": tau_p,
+                "flow_timescale_seconds": flow_timescale,
+                "stokes_number": _effective_stokes_number(info, spec),
+                "output_path": item.get("path", info.get("output_path")),
+            }
+        )
 
     return pd.DataFrame(rows)
 

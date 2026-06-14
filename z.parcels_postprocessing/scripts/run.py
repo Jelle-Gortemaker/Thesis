@@ -103,18 +103,15 @@ def make_particle_tag(
     tau_p_seconds: float = 0.0,
     stokes_number: float = np.nan,
 ) -> str:
-    """Create a compact file-safe particle class tag."""
+    """Create a compact tag containing only tau_p."""
     if particle_class == "passive":
         return "passive"
 
     if particle_class != "mr_sm":
         raise ValueError(f"Unknown particle_class: {particle_class}")
 
-    return (
-        "mrsm_"
-        f"tau{_safe_number(tau_p_seconds)}s_"
-        f"St{_safe_number(stokes_number)}"
-    )
+    tau_txt = _format_tau_label(tau_p_seconds).replace(" ", "")
+    return f"tau{tau_txt}"
 
 
 def make_particle_label(
@@ -127,15 +124,12 @@ def make_particle_label(
     if particle_class == "passive":
         return "Tracer"
 
-    if particle_class != "mr_sm":
-        raise ValueError(f"Unknown particle_class: {particle_class}")
-
     tau_txt = _format_tau_label(tau_p_seconds)
 
     if np.isfinite(stokes_number):
-        return f"tau={tau_txt}, St={stokes_number:.3g}"
+        return f"τₚ={tau_txt}, St={stokes_number:.3g}"
 
-    return f"tau={tau_txt}"
+    return f"τₚ={tau_txt}"
 
 
 def _grid_spacing_1d(a: np.ndarray) -> float:
