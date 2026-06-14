@@ -1135,6 +1135,582 @@ def plot_residence_time_pdf(
     return ax
 
 
+
+
+
+# ============================================================
+# CLUSTERED-STATE PERSISTENCE + LAGRANGIAN AUTOCORRELATION
+# ============================================================
+
+def _bridge_short_false_gaps_1d(
+    flags: np.ndarray,
+    max_gap_obs: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Bridge short internal False gaps in a Boolean clustered-state series.
+
+    Only gaps bounded by True values on both sides are filled. Leading and
+    trailing False values are never changed.
+
+    Returns
+    -------
+    tolerant_flags
+        Clustered-state flags after bridging eligible gaps.
+    gap_filled
+        Boolean mask identifying observations changed from False to True.
+    """
+    flags = np.asarray(flags, dtype=bool)
+    tolerant = flags.copy()
+    gap_filled = np.zeros_like(flags, dtype=bool)
+
+    max_gap_obs = int(max_gap_obs)
+    if max_gap_obs < 0:
+        raise ValueError("max_gap_obs must be >= 0.")
+    if max_gap_obs == 0 or flags.size < 3:
+        return tolerant, gap_filled
+
+    i = 0
+    n = flags.size
+    while i < n:
+        if flags[i]:
+            i += 1
+            continue
+
+        gap_start = i
+        while i < n and not flags[i]:
+            i += 1
+        gap_end = i - 1
+        gap_length = gap_end - gap_start + 1
+
+        bounded_left = gap_start > 0 and flags[gap_start - 1]
+        bounded_right = i < n and flags[i]
+
+        if bounded_left and bounded_right and gap_length <= max_gap_obs:
+            tolerant[gap_start:i] = True
+            gap_filled[gap_start:i] = True
+
+    return tolerant, gap_filled
+
+
+def apply_clustered_state_gap_tolerance(
+    cluster_ds: xr.Dataset,
+    *,
+    max_unclustered_gap_obs: int = 1,
+) -> xr.Dataset:
+    """
+    Add tolerant clustered-state flags to a Voronoï clustering time series.
+
+    A short internal unclustered gap is bridged when it is bounded by clustered
+    observations on both sides. With max_unclustered_gap_obs=1, the sequence
+
+        True, False, True
+
+    is treated as one continuous clustered-state episode.
+
+    The original ``cluster_flag`` is retained. The returned dataset adds:
+
+        cluster_flag_tolerant(trajectory, obs)
+        gap_filled_flag(trajectory, obs)
+    """
+    if "cluster_flag" not in cluster_ds:
+        raise KeyError("cluster_ds must contain 'cluster_flag'.")
+
+    raw = np.asarray(cluster_ds["cluster_flag"].values, dtype=bool)
+    tolerant = np.zeros_like(raw, dtype=bool)
+    filled = np.zeros_like(raw, dtype=bool)
+
+    for traj_idx in range(raw.shape[0]):
+        tolerant[traj_idx], filled[traj_idx] = _bridge_short_false_gaps_1d(
+            raw[traj_idx],
+            max_gap_obs=max_unclustered_gap_obs,
+        )
+
+    out = cluster_ds.copy()
+    out["cluster_flag_tolerant"] = xr.DataArray(
+        tolerant.astype(np.int8),
+        dims=cluster_ds["cluster_flag"].dims,
+        coords=cluster_ds["cluster_flag"].coords,
+        attrs={
+            "description": "Clustered-state flag after bridging short internal unclustered gaps.",
+            "max_unclustered_gap_obs": int(max_unclustered_gap_obs),
+        },
+    )
+    out["gap_filled_flag"] = xr.DataArray(
+        filled.astype(np.int8),
+        dims=cluster_ds["cluster_flag"].dims,
+        coords=cluster_ds["cluster_flag"].coords,
+        attrs={
+            "description": "1 where an unclustered observation was bridged by the tolerance rule.",
+        },
+    )
+    out.attrs["max_unclustered_gap_obs"] = int(max_unclustered_gap_obs)
+    out.attrs["tolerant_cluster_flag_definition"] = (
+        "cluster_flag with internal False gaps of length <= "
+        f"{int(max_unclustered_gap_obs)} bridged when bounded by True values"
+    )
+    return out
+
+
+def compute_clustered_state_residence_times(
+    cluster_ds: xr.Dataset,
+    ds_traj: xr.Dataset | None = None,
+    *,
+    min_duration_obs: int = 1,
+    flag_name: str | None = None,
+) -> xr.Dataset:
+    """
+    Compute particle clustered-state residence episodes.
+
+    This is an individual-particle metric: an episode is a continuous interval
+    during which a particle is classified as locally clustered according to its
+    normalized Voronoï-cell area. It is not the lifetime of a tracked spatial
+    cluster object.
+
+    If ``cluster_flag_tolerant`` is present, it is used by default; otherwise
+    ``cluster_flag`` is used. The event duration is the occupied output-frame
+    span, ``duration_obs * median_output_interval``. When a short unclustered
+    gap was bridged, that frame is included in the episode span and reported
+    separately through ``gap_obs_count``.
+    """
+    if flag_name is None:
+        flag_name = (
+            "cluster_flag_tolerant"
+            if "cluster_flag_tolerant" in cluster_ds
+            else "cluster_flag"
+        )
+
+    if flag_name not in cluster_ds:
+        raise KeyError(f"cluster_ds does not contain {flag_name!r}.")
+
+    tolerant_flags = np.asarray(cluster_ds[flag_name].values, dtype=bool)
+    raw_flags = np.asarray(
+        cluster_ds.get("cluster_flag", cluster_ds[flag_name]).values,
+        dtype=bool,
+    )
+    obs = np.asarray(cluster_ds["obs"].values, dtype=int)
+
+    if ds_traj is not None:
+        t_days = _obs_time_days(ds_traj, obs)
+    else:
+        t_days = np.arange(len(obs), dtype=float)
+
+    if len(t_days) > 1:
+        dt_days = float(np.nanmedian(np.diff(t_days)))
+    else:
+        dt_days = 1.0
+
+    if not np.isfinite(dt_days) or dt_days <= 0.0:
+        raise ValueError("Could not determine a positive trajectory output interval.")
+
+    events: list[tuple] = []
+
+    for traj_idx in range(tolerant_flags.shape[0]):
+        f = tolerant_flags[traj_idx]
+        raw = raw_flags[traj_idx]
+        i = 0
+
+        while i < len(f):
+            if not f[i]:
+                i += 1
+                continue
+
+            start = i
+            while i + 1 < len(f) and f[i + 1]:
+                i += 1
+            end = i
+
+            duration_obs = end - start + 1
+            if duration_obs >= int(min_duration_obs):
+                clustered_obs_count = int(np.count_nonzero(raw[start:end + 1]))
+                gap_obs_count = int(duration_obs - clustered_obs_count)
+                duration_days = float(duration_obs * dt_days)
+
+                left_censored = start == 0
+                right_censored = end == len(f) - 1
+
+                events.append(
+                    (
+                        int(traj_idx),
+                        int(obs[start]),
+                        int(obs[end]),
+                        int(duration_obs),
+                        clustered_obs_count,
+                        gap_obs_count,
+                        duration_days,
+                        float(t_days[start]),
+                        float(t_days[end]),
+                        int(left_censored),
+                        int(right_censored),
+                    )
+                )
+
+            i += 1
+
+    if len(events) == 0:
+        data = np.empty((0, 11), dtype=float)
+    else:
+        data = np.asarray(events, dtype=float)
+
+    return xr.Dataset(
+        data_vars={
+            "trajectory": ("event", data[:, 0].astype(int) if data.size else np.array([], dtype=int)),
+            "start_obs": ("event", data[:, 1].astype(int) if data.size else np.array([], dtype=int)),
+            "end_obs": ("event", data[:, 2].astype(int) if data.size else np.array([], dtype=int)),
+            "duration_obs": ("event", data[:, 3].astype(int) if data.size else np.array([], dtype=int)),
+            "clustered_obs_count": ("event", data[:, 4].astype(int) if data.size else np.array([], dtype=int)),
+            "gap_obs_count": ("event", data[:, 5].astype(int) if data.size else np.array([], dtype=int)),
+            "duration_days": ("event", data[:, 6] if data.size else np.array([], dtype=float)),
+            "start_day": ("event", data[:, 7] if data.size else np.array([], dtype=float)),
+            "end_day": ("event", data[:, 8] if data.size else np.array([], dtype=float)),
+            "left_censored": ("event", data[:, 9].astype(np.int8) if data.size else np.array([], dtype=np.int8)),
+            "right_censored": ("event", data[:, 10].astype(np.int8) if data.size else np.array([], dtype=np.int8)),
+        },
+        coords={"event": np.arange(len(events), dtype=int)},
+        attrs={
+            "description": "Individual-particle clustered-state residence episodes based on Voronoi area.",
+            "metric_name": "particle clustered-state residence time",
+            "flag_name": flag_name,
+            "min_duration_obs": int(min_duration_obs),
+            "output_interval_days": float(dt_days),
+            "duration_definition": "duration_obs * median trajectory output interval",
+            "interpretation": (
+                "Consecutive time an individual particle remains locally clustered; "
+                "not the lifetime of a tracked spatial cluster object."
+            ),
+        },
+    )
+
+
+def clustered_state_residence_summary(
+    residence_ds: xr.Dataset,
+    *,
+    complete_events_only: bool = False,
+) -> xr.Dataset:
+    """Compact statistics of particle clustered-state residence episodes."""
+    n_total = int(residence_ds.sizes.get("event", 0))
+
+    if n_total == 0 or "duration_days" not in residence_ds:
+        vals = np.array([], dtype=float)
+        complete_mask = np.array([], dtype=bool)
+    else:
+        vals_all = np.asarray(residence_ds["duration_days"].values, dtype=float)
+        left = np.asarray(
+            residence_ds.get("left_censored", xr.zeros_like(residence_ds["duration_days"])).values,
+            dtype=bool,
+        )
+        right = np.asarray(
+            residence_ds.get("right_censored", xr.zeros_like(residence_ds["duration_days"])).values,
+            dtype=bool,
+        )
+        complete_mask = ~(left | right)
+        use_mask = complete_mask if complete_events_only else np.ones_like(complete_mask, dtype=bool)
+        vals = vals_all[use_mask & np.isfinite(vals_all)]
+
+    n_complete = int(np.count_nonzero(complete_mask))
+    n_censored = int(n_total - n_complete)
+
+    if vals.size == 0:
+        stats = {
+            "n_events": n_total,
+            "n_complete_events": n_complete,
+            "n_censored_events": n_censored,
+            "mean_days": np.nan,
+            "median_days": np.nan,
+            "p95_days": np.nan,
+            "max_days": np.nan,
+        }
+    else:
+        stats = {
+            "n_events": n_total,
+            "n_complete_events": n_complete,
+            "n_censored_events": n_censored,
+            "mean_days": float(np.nanmean(vals)),
+            "median_days": float(np.nanmedian(vals)),
+            "p95_days": float(np.nanpercentile(vals, 95)),
+            "max_days": float(np.nanmax(vals)),
+        }
+
+    out = xr.Dataset({k: xr.DataArray(v) for k, v in stats.items()})
+    out.attrs.update(
+        {
+            "description": "Summary of particle clustered-state residence episodes.",
+            "complete_events_only": int(bool(complete_events_only)),
+        }
+    )
+    return out
+
+
+def _first_crossing_time(x: np.ndarray, y: np.ndarray, level: float) -> float:
+    """Linearly interpolate the first downward crossing of ``level``."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    for i in range(1, len(y)):
+        if not (np.isfinite(y[i - 1]) and np.isfinite(y[i])):
+            continue
+        if y[i - 1] >= level and y[i] <= level:
+            dy = y[i] - y[i - 1]
+            if dy == 0.0:
+                return float(x[i])
+            frac = (level - y[i - 1]) / dy
+            return float(x[i - 1] + frac * (x[i] - x[i - 1]))
+
+    return np.nan
+
+
+def compute_lagrangian_voronoi_concentration_autocorrelation(
+    cluster_ds: xr.Dataset,
+    ds_traj: xr.Dataset | None = None,
+    *,
+    max_lag_obs: int | None = None,
+    min_pairs: int = 100,
+    fit_min_rho: float = 0.2,
+    fit_max_rho: float = 0.9,
+) -> xr.Dataset:
+    r"""
+    Compute the Lagrangian autocorrelation of Voronoï concentration.
+
+    Following Li et al. (2025), the local particle concentration is
+
+        c_i(t) = 1 / A_i(t),
+
+    where A_i is the Voronoï-cell area of particle i. The autocorrelation is
+
+        rho_c(tau) = <c'(t)c'(t+tau)> / <c'^2>,
+
+    with c' obtained by subtracting the ensemble-time mean concentration.
+    A characteristic clustering-persistence timescale is obtained by fitting
+
+        rho_c(tau) = exp(-tau / T_c)
+
+    over the positive decaying range selected by fit_min_rho and fit_max_rho.
+    The fit is constrained through rho_c(0)=1.
+    """
+    if "voronoi_area" not in cluster_ds:
+        raise KeyError("cluster_ds must contain 'voronoi_area'.")
+
+    area = np.asarray(cluster_ds["voronoi_area"].values, dtype=float)
+    concentration = np.full_like(area, np.nan, dtype=float)
+    valid_area = np.isfinite(area) & (area > 0.0)
+    concentration[valid_area] = 1.0 / area[valid_area]
+
+    mean_c = float(np.nanmean(concentration))
+    fluct = concentration - mean_c
+    variance = float(np.nanmean(fluct**2))
+
+    if not np.isfinite(variance) or variance <= 0.0:
+        raise ValueError("Voronoï concentration variance is not positive.")
+
+    obs = np.asarray(cluster_ds["obs"].values, dtype=int)
+    n_obs = len(obs)
+
+    if ds_traj is not None:
+        t_days = _obs_time_days(ds_traj, obs)
+    else:
+        t_days = np.arange(n_obs, dtype=float)
+
+    if n_obs > 1:
+        dt_days = float(np.nanmedian(np.diff(t_days)))
+    else:
+        dt_days = 1.0
+
+    if max_lag_obs is None:
+        max_lag_obs = max(1, n_obs // 2)
+    max_lag_obs = int(min(max_lag_obs, n_obs - 1))
+
+    lags = np.arange(max_lag_obs + 1, dtype=int)
+    rho = np.full(max_lag_obs + 1, np.nan, dtype=float)
+    n_pairs = np.zeros(max_lag_obs + 1, dtype=np.int64)
+
+    for lag in lags:
+        if lag == 0:
+            a = fluct
+            b = fluct
+        else:
+            a = fluct[:, :-lag]
+            b = fluct[:, lag:]
+
+        pair_valid = np.isfinite(a) & np.isfinite(b)
+        n_pairs[lag] = int(np.count_nonzero(pair_valid))
+
+        if n_pairs[lag] >= int(min_pairs):
+            rho[lag] = float(np.nanmean((a * b)[pair_valid]) / variance)
+
+    if np.isfinite(rho[0]):
+        rho[0] = 1.0
+
+    lag_days = lags.astype(float) * dt_days
+
+    # Restrict fitting to the positive branch before the first non-positive lag.
+    positive_end = len(rho)
+    nonpositive = np.flatnonzero((lags > 0) & np.isfinite(rho) & (rho <= 0.0))
+    if nonpositive.size:
+        positive_end = int(nonpositive[0])
+
+    fit_mask = (
+        (lags > 0)
+        & (lags < positive_end)
+        & np.isfinite(rho)
+        & (rho > 0.0)
+        & (rho >= float(fit_min_rho))
+        & (rho <= float(fit_max_rho))
+        & (n_pairs >= int(min_pairs))
+    )
+
+    timescale_fit_days = np.nan
+    fit_r2 = np.nan
+    fitted_rho = np.full_like(rho, np.nan, dtype=float)
+
+    if np.count_nonzero(fit_mask) >= 2:
+        x = lag_days[fit_mask]
+        y = np.log(rho[fit_mask])
+
+        # Least-squares fit through the origin: log(rho) = -tau/T_c.
+        denom = float(np.dot(x, x))
+        slope = float(np.dot(x, y) / denom) if denom > 0.0 else np.nan
+
+        if np.isfinite(slope) and slope < 0.0:
+            timescale_fit_days = float(-1.0 / slope)
+            fitted_rho = np.exp(-lag_days / timescale_fit_days)
+
+            y_pred = slope * x
+            ss_res = float(np.sum((y - y_pred) ** 2))
+            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+            fit_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else np.nan
+
+    timescale_efold_days = _first_crossing_time(
+        lag_days,
+        rho,
+        np.exp(-1.0),
+    )
+
+    # Positive-lobe integral timescale, truncated at first non-positive value.
+    positive_mask = np.isfinite(rho[:positive_end]) & (rho[:positive_end] > 0.0)
+    if np.count_nonzero(positive_mask) >= 2:
+        timescale_integral_days = float(
+            np.trapezoid(rho[:positive_end][positive_mask], lag_days[:positive_end][positive_mask])
+        )
+    else:
+        timescale_integral_days = np.nan
+
+    return xr.Dataset(
+        data_vars={
+            "autocorrelation": ("lag", rho),
+            "exponential_fit": ("lag", fitted_rho),
+            "n_pairs": ("lag", n_pairs),
+            "timescale_expfit_days": xr.DataArray(timescale_fit_days),
+            "timescale_efold_days": xr.DataArray(timescale_efold_days),
+            "timescale_integral_days": xr.DataArray(timescale_integral_days),
+            "fit_r2": xr.DataArray(fit_r2),
+            "mean_concentration": xr.DataArray(mean_c),
+            "concentration_variance": xr.DataArray(variance),
+        },
+        coords={
+            "lag": lags,
+            "lag_days": ("lag", lag_days),
+        },
+        attrs={
+            "description": "Lagrangian autocorrelation of inverse Voronoi-cell area.",
+            "metric_name": "Voronoi-concentration clustering-persistence timescale",
+            "concentration_definition": "c = 1 / voronoi_area",
+            "autocorrelation_definition": "<c'(t)c'(t+tau)> / <c'^2>",
+            "timescale_definition": "rho(tau)=exp(-tau/Tc), fitted through rho(0)=1",
+            "output_interval_days": float(dt_days),
+            "max_lag_obs": int(max_lag_obs),
+            "min_pairs": int(min_pairs),
+            "fit_min_rho": float(fit_min_rho),
+            "fit_max_rho": float(fit_max_rho),
+        },
+    )
+
+
+def plot_clustered_state_residence_pdf(
+    residence_ds: xr.Dataset,
+    *,
+    ax=None,
+    bins: int | np.ndarray = 30,
+    label: str | None = None,
+    color=None,
+    title: str | None = None,
+    complete_events_only: bool = False,
+):
+    """Plot the PDF of particle clustered-state residence durations."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4), facecolor="white")
+
+    if residence_ds.sizes.get("event", 0) == 0:
+        ax.text(0.5, 0.5, "No clustered-state episodes", ha="center", va="center", transform=ax.transAxes)
+        return ax
+
+    vals = np.asarray(residence_ds["duration_days"].values, dtype=float)
+    
+
+    if complete_events_only and "left_censored" in residence_ds and "right_censored" in residence_ds:
+        left = np.asarray(residence_ds["left_censored"].values, dtype=bool)
+        right = np.asarray(residence_ds["right_censored"].values, dtype=bool)
+        vals = vals[~(left | right)]
+
+    vals = vals[np.isfinite(vals)]
+
+    if vals.size == 0:
+        ax.text(0.5, 0.5, "No complete clustered-state episodes", ha="center", va="center", transform=ax.transAxes)
+        return ax
+    
+    weights = np.ones_like(vals) / len(vals)
+
+    ax.hist(vals, bins=bins, weights=weights, histtype="step", linewidth=2.0, label=label)
+
+    ax.set_xlabel("Residence time [days]")
+    ax.set_ylabel("Fraction of residence events")   
+    if title is not None:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    return ax
+
+
+def plot_lagrangian_voronoi_concentration_autocorrelation(
+    autocorr_ds: xr.Dataset,
+    *,
+    ax=None,
+    label: str | None = None,
+    color=None,
+    title: str | None = None,
+    show_fit: bool = True,
+):
+    """Plot the Lagrangian autocorrelation of c=1/A_V and its exponential fit."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4), facecolor="white")
+
+    lag_days = np.asarray(autocorr_ds["lag_days"].values, dtype=float)
+    rho = np.asarray(autocorr_ds["autocorrelation"].values, dtype=float)
+
+    ax.plot(lag_days, rho, lw=1.8, color=color, label=label)
+
+    if show_fit and "exponential_fit" in autocorr_ds:
+        fit = np.asarray(autocorr_ds["exponential_fit"].values, dtype=float)
+        if np.any(np.isfinite(fit)):
+            fit_label = None
+            tc = float(autocorr_ds["timescale_expfit_days"].values)
+            if label is not None and np.isfinite(tc):
+                fit_label = rf"{label} fit: $T_c={tc:.2f}$ d"
+            ax.plot(lag_days, fit, lw=1.2, ls="--", color=color, alpha=0.8, label=fit_label)
+
+    ax.axhline(0.0, color="0.35", lw=0.8)
+    ax.axhline(np.exp(-1.0), color="0.5", lw=0.8, ls=":")
+    ax.set_xlabel(r"lag $\tau$ [days]")
+    ax.set_ylabel(r"$\rho_c^L(\tau)$")
+    if title is not None:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    return ax
+
+
+# Backward-compatible aliases for older notebook cells.
+compute_cluster_residence_times = compute_clustered_state_residence_times
+residence_summary = clustered_state_residence_summary
+plot_residence_time_pdf = plot_clustered_state_residence_pdf
+
+
 # ============================================================
 # PARTICLE-LEVEL RESIDENCE LABELS FOR FLOW COUPLING
 # ============================================================
