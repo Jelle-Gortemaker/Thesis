@@ -1005,3 +1005,814 @@ def short_time_title(run_case: str, elapsed_days: float | None = None) -> str:
     if elapsed_days is None or not np.isfinite(float(elapsed_days)):
         return str(run_case)
     return f"T={float(elapsed_days):.2f} d | {run_case}"
+
+
+# ============================================================
+# COUPLED FLOW-PARTICLE ANALYSIS HELPERS
+# ============================================================
+
+def resolve_obs_indices(selections, n_obs: int) -> list[int]:
+    """Resolve and deduplicate observation selections."""
+    resolved = []
+    for selection in selections:
+        obs_idx = resolve_obs_index(selection, n_obs)
+        if 0 <= obs_idx < n_obs:
+            resolved.append(int(obs_idx))
+        else:
+            print(f"Skipping invalid particle obs selection: {selection}")
+    return sorted(set(resolved))
+
+
+def _numeric_time_seconds(value) -> float:
+    arr = np.asarray(value)
+
+    if np.issubdtype(arr.dtype, np.timedelta64):
+        return float(arr / np.timedelta64(1, "s"))
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return np.nan
+    return float(arr)
+
+
+def particle_absolute_time_seconds(
+    ds_traj: xr.Dataset,
+    obs_idx: int,
+    *,
+    ds_parcels: xr.Dataset,
+    release_time_index: int,
+) -> float:
+    """Return the absolute particle time in seconds for one saved observation."""
+    t = ds_traj["time"].isel(trajectory=0, obs=obs_idx).values
+    t_seconds = _numeric_time_seconds(t)
+
+    if np.isfinite(t_seconds):
+        return t_seconds
+
+    t0 = ds_traj["time"].isel(trajectory=0, obs=0).values
+    elapsed_seconds = float((t - t0) / np.timedelta64(1, "s"))
+    release_seconds = float(ds_parcels["time"].isel(time=release_time_index))
+    return release_seconds + elapsed_seconds
+
+
+def build_particle_flow_time_alignment(
+    reference_ds: xr.Dataset,
+    obs_indices: Iterable[int],
+    *,
+    ds_parcels: xr.Dataset,
+    release_time_index: int,
+) -> pd.DataFrame:
+    """Match each particle output time to the nearest available flow time."""
+    flow_times_seconds = np.asarray(ds_parcels["time"].values, dtype=float)
+    records = []
+
+    for obs_idx in obs_indices:
+        particle_time_seconds = particle_absolute_time_seconds(
+            reference_ds,
+            int(obs_idx),
+            ds_parcels=ds_parcels,
+            release_time_index=release_time_index,
+        )
+        flow_idx = int(np.argmin(np.abs(flow_times_seconds - particle_time_seconds)))
+        flow_time_seconds = float(flow_times_seconds[flow_idx])
+        mismatch_seconds = abs(flow_time_seconds - particle_time_seconds)
+
+        records.append(
+            {
+                "obs": int(obs_idx),
+                "particle_time_seconds": particle_time_seconds,
+                "elapsed_days": get_elapsed_time_days(reference_ds, int(obs_idx)),
+                "flow_time_index": flow_idx,
+                "flow_time_seconds": flow_time_seconds,
+                "mismatch_seconds": mismatch_seconds,
+            }
+        )
+
+    return pd.DataFrame(records).set_index("obs")
+
+
+def build_selected_flow_diagnostics(
+    ds_flow_raw: xr.Dataset,
+    time_alignment: pd.DataFrame,
+    *,
+    analysis_obs_indices: Iterable[int],
+    flow_level_indices: Iterable[int],
+    dx: float,
+    dy: float,
+    f0: float,
+    ds_parcels: xr.Dataset,
+    time_dim: str,
+    z_dim: str,
+    compute_surface_kinematics,
+    case_name: str,
+    run_collection_id: str,
+    data_file: str | Path,
+) -> xr.Dataset:
+    """Compute the selected Eulerian flow diagnostics with the shared formula."""
+    analysis_obs_indices = list(analysis_obs_indices)
+    flow_level_indices = tuple(flow_level_indices)
+
+    ro_stack = []
+    div_stack = []
+    strain_stack = []
+
+    for _, row in time_alignment.loc[analysis_obs_indices].iterrows():
+        flow_idx = int(row["flow_time_index"])
+
+        ro, div_f, strain_f = compute_surface_kinematics(
+            ds_flow_raw,
+            time_dim=time_dim,
+            z_dim=z_dim,
+            it=flow_idx,
+            levels=list(flow_level_indices),
+            dx=dx,
+            dy=dy,
+            f0=f0,
+        )
+
+        ro_stack.append(np.asarray(ro, dtype=np.float32))
+        div_stack.append(np.asarray(div_f, dtype=np.float32))
+        strain_stack.append(np.asarray(strain_f, dtype=np.float32))
+
+    return xr.Dataset(
+        data_vars={
+            "ro": (
+                ("obs", "y", "x"),
+                np.stack(ro_stack, axis=0),
+                {"long_name": "Rossby number", "definition": "zeta / f0", "units": "1"},
+            ),
+            "div_f": (
+                ("obs", "y", "x"),
+                np.stack(div_stack, axis=0),
+                {
+                    "long_name": "normalized horizontal divergence",
+                    "definition": "div_h(u) / f0",
+                    "units": "1",
+                },
+            ),
+            "strain_f": (
+                ("obs", "y", "x"),
+                np.stack(strain_stack, axis=0),
+                {
+                    "long_name": "normalized horizontal strain",
+                    "definition": "sigma / abs(f0)",
+                    "units": "1",
+                },
+            ),
+        },
+        coords={
+            "obs": np.asarray(analysis_obs_indices, dtype=int),
+            "x": np.asarray(ds_parcels["x"].values, dtype=float),
+            "y": np.asarray(ds_parcels["y"].values, dtype=float),
+            "flow_time_index": (
+                "obs",
+                time_alignment.loc[analysis_obs_indices, "flow_time_index"].values.astype(int),
+            ),
+            "time_seconds": (
+                "obs",
+                time_alignment.loc[analysis_obs_indices, "flow_time_seconds"].values.astype(float),
+            ),
+            "elapsed_days": (
+                "obs",
+                time_alignment.loc[analysis_obs_indices, "elapsed_days"].values.astype(float),
+            ),
+            "time_mismatch_seconds": (
+                "obs",
+                time_alignment.loc[analysis_obs_indices, "mismatch_seconds"].values.astype(float),
+            ),
+        },
+        attrs={
+            "case_name": case_name,
+            "run_collection_id": run_collection_id,
+            "source_file": str(data_file),
+            "flow_formula_source": "shcherbina_utils.compute_surface_kinematics",
+            "flow_level_indices": ",".join(map(str, flow_level_indices)),
+            "dx_m": float(dx),
+            "dy_m": float(dy),
+            "f0_s-1": float(f0),
+            "analysis_particle_obs": ",".join(map(str, analysis_obs_indices)),
+        },
+    )
+
+
+def load_or_recompute_cluster_data(
+    particle_tag: str,
+    ds_traj: xr.Dataset,
+    *,
+    particle_level_tag: str,
+    release_time_index: int,
+    metrics_dir: str | Path,
+    analysis_obs_indices: Iterable[int],
+    domain,
+    metrics_clustering,
+    fallback_threshold: float = 0.5,
+) -> xr.Dataset:
+    """Load saved particle clustering fields, or recompute them if needed."""
+    analysis_obs_indices = list(analysis_obs_indices)
+    metrics_dir = Path(metrics_dir)
+    stem = f"{particle_tag}_{particle_level_tag}_release_t{release_time_index:04d}"
+
+    cluster_path = metrics_dir / "voronoi" / f"{stem}_clustered_state_timeseries.nc"
+    if cluster_path.exists():
+        with xr.open_dataset(cluster_path) as ds_open:
+            cluster_full = ds_open.load()
+
+        if np.all(
+            np.isin(
+                analysis_obs_indices,
+                np.asarray(cluster_full["obs"].values),
+            )
+        ):
+            print(f"  using saved Voronoï metrics: {cluster_path.name}")
+            return cluster_full.sel(obs=analysis_obs_indices)
+
+        print(
+            "  saved Voronoï metrics do not contain every requested obs; "
+            "recomputing."
+        )
+
+    pdf_path = metrics_dir / "voronoi" / f"{stem}_aggregate_pdf.nc"
+    if pdf_path.exists():
+        with xr.open_dataset(pdf_path) as ds_open:
+            class_threshold = float(ds_open["cluster_threshold_nu_c"].load().values)
+    else:
+        class_threshold = np.nan
+
+    if not np.isfinite(class_threshold) or class_threshold <= 0.0:
+        class_threshold = float(fallback_threshold)
+        print(
+            "  warning: no valid saved aggregate threshold; "
+            f"using fallback nu_c={class_threshold:.3f}"
+        )
+
+    return metrics_clustering.compute_voronoi_clustering_timeseries(
+        ds_traj=ds_traj,
+        obs_indices=analysis_obs_indices,
+        domain=domain,
+        threshold_method="fixed",
+        fixed_threshold_area_norm=class_threshold,
+        log_area=False,
+    )
+
+
+def extend_periodic_snapshot(flow_snapshot: xr.Dataset, domain) -> xr.Dataset:
+    """Add one periodic halo cell around an xarray flow snapshot."""
+    left = flow_snapshot.isel(x=[-1]).assign_coords(
+        x=[float(flow_snapshot["x"].values[-1] - domain.Lx)]
+    )
+    right = flow_snapshot.isel(x=[0]).assign_coords(
+        x=[float(flow_snapshot["x"].values[0] + domain.Lx)]
+    )
+    extended_x = xr.concat([left, flow_snapshot, right], dim="x")
+
+    bottom = extended_x.isel(y=[-1]).assign_coords(
+        y=[float(extended_x["y"].values[-1] - domain.Ly)]
+    )
+    top = extended_x.isel(y=[0]).assign_coords(
+        y=[float(extended_x["y"].values[0] + domain.Ly)]
+    )
+    return xr.concat([bottom, extended_x, top], dim="y")
+
+
+def sample_flow_snapshot_at_particles(
+    flow_snapshot: xr.Dataset,
+    xp,
+    yp,
+    *,
+    domain,
+    wrap_to_domain,
+) -> dict[str, np.ndarray]:
+    """Sample Ro, divergence and strain at periodic particle positions."""
+    trajectory_coord = np.arange(len(xp), dtype=int)
+    xp_wrapped, yp_wrapped = wrap_to_domain(
+        np.asarray(xp, dtype=float),
+        np.asarray(yp, dtype=float),
+        domain,
+    )
+
+    xp_da = xr.DataArray(
+        xp_wrapped,
+        dims="trajectory",
+        coords={"trajectory": trajectory_coord},
+    )
+    yp_da = xr.DataArray(
+        yp_wrapped,
+        dims="trajectory",
+        coords={"trajectory": trajectory_coord},
+    )
+
+    flow_periodic = extend_periodic_snapshot(flow_snapshot, domain)
+    sampled = {}
+    for name in ["ro", "div_f", "strain_f"]:
+        sampled[name] = np.asarray(
+            flow_periodic[name].interp(x=xp_da, y=yp_da).values,
+            dtype=np.float32,
+        )
+    return sampled
+
+
+def build_coupled_class_dataset(
+    particle_tag: str,
+    item: dict,
+    cluster_selected: xr.Dataset,
+    *,
+    ds_flow: xr.Dataset,
+    analysis_obs_indices: Iterable[int],
+    time_alignment: pd.DataFrame,
+    domain,
+    wrap_to_domain,
+    case_name: str,
+    run_title_info: str,
+    run_collection_id: str,
+) -> xr.Dataset:
+    """Build the compact per-class particle-flow coupling dataset."""
+    analysis_obs_indices = list(analysis_obs_indices)
+    ds_traj = item["ds"]
+    xname, yname = get_xy_names(ds_traj)
+
+    n_particles = ds_traj.sizes["trajectory"]
+    n_selected = len(analysis_obs_indices)
+
+    x_particle = np.full((n_particles, n_selected), np.nan, dtype=np.float32)
+    y_particle = np.full_like(x_particle, np.nan)
+    ro_particle = np.full_like(x_particle, np.nan)
+    div_particle = np.full_like(x_particle, np.nan)
+    strain_particle = np.full_like(x_particle, np.nan)
+
+    for j, obs_idx in enumerate(analysis_obs_indices):
+        xp = np.asarray(ds_traj[xname].isel(obs=obs_idx).values, dtype=float)
+        yp = np.asarray(ds_traj[yname].isel(obs=obs_idx).values, dtype=float)
+
+        x_particle[:, j] = xp.astype(np.float32)
+        y_particle[:, j] = yp.astype(np.float32)
+
+        sampled = sample_flow_snapshot_at_particles(
+            ds_flow.sel(obs=obs_idx),
+            xp,
+            yp,
+            domain=domain,
+            wrap_to_domain=wrap_to_domain,
+        )
+        ro_particle[:, j] = sampled["ro"]
+        div_particle[:, j] = sampled["div_f"]
+        strain_particle[:, j] = sampled["strain_f"]
+
+    area = np.asarray(cluster_selected["voronoi_area"].values, dtype=np.float32)
+    area_norm = np.asarray(cluster_selected["voronoi_area_norm"].values, dtype=np.float32)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        concentration = 1.0 / area
+        concentration_norm = 1.0 / area_norm
+
+    concentration[~np.isfinite(concentration)] = np.nan
+    concentration_norm[~np.isfinite(concentration_norm)] = np.nan
+
+    data_vars = {
+        "x_particle": (("trajectory", "obs"), x_particle, {"units": "m"}),
+        "y_particle": (("trajectory", "obs"), y_particle, {"units": "m"}),
+        "ro_particle": (
+            ("trajectory", "obs"),
+            ro_particle,
+            {"definition": "zeta/f0 sampled at particle position"},
+        ),
+        "div_f_particle": (
+            ("trajectory", "obs"),
+            div_particle,
+            {"definition": "div_h(u)/f0 sampled at particle position"},
+        ),
+        "strain_f_particle": (
+            ("trajectory", "obs"),
+            strain_particle,
+            {"definition": "sigma/abs(f0) sampled at particle position"},
+        ),
+        "voronoi_area": (("trajectory", "obs"), area, {"units": "m2"}),
+        "voronoi_area_norm": (
+            ("trajectory", "obs"),
+            area_norm,
+            {"definition": "A / mean(A) at each snapshot"},
+        ),
+        "voronoi_concentration": (
+            ("trajectory", "obs"),
+            concentration.astype(np.float32),
+            {"units": "m-2", "definition": "1/A"},
+        ),
+        "particle_concentration_norm": (
+            ("trajectory", "obs"),
+            concentration_norm.astype(np.float32),
+            {"units": "1", "definition": "mean(A)/A = 1/(A/mean(A))"},
+        ),
+    }
+
+    for name in ["cluster_flag", "cluster_flag_tolerant", "gap_filled_flag"]:
+        if name in cluster_selected:
+            data_vars[name] = (
+                ("trajectory", "obs"),
+                np.asarray(cluster_selected[name].values),
+            )
+
+    coords = {
+        "trajectory": np.arange(n_particles, dtype=int),
+        "obs": np.asarray(analysis_obs_indices, dtype=int),
+        "time_seconds": (
+            "obs",
+            time_alignment.loc[analysis_obs_indices, "particle_time_seconds"].values.astype(float),
+        ),
+        "elapsed_days": (
+            "obs",
+            time_alignment.loc[analysis_obs_indices, "elapsed_days"].values.astype(float),
+        ),
+        "flow_time_index": (
+            "obs",
+            time_alignment.loc[analysis_obs_indices, "flow_time_index"].values.astype(int),
+        ),
+    }
+
+    coords["release_id"] = ("trajectory", get_release_ids(ds_traj).astype(int))
+
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "case_name": case_name,
+            "run_title_info": run_title_info,
+            "run_collection_id": run_collection_id,
+            "particle_tag": particle_tag,
+            "particle_label": item.get("display_label", item.get("label", particle_tag)),
+            "source_trajectory": str(item["path"]),
+            "flow_formula_source": "shcherbina_utils.compute_surface_kinematics",
+            "voronoi_formula_source": (
+                "saved clustered_state_timeseries.nc generated by "
+                "metrics_clustering.compute_voronoi_clustering_timeseries"
+            ),
+            "analysis_particle_obs": ",".join(map(str, analysis_obs_indices)),
+        },
+    )
+
+
+def cluster_var_name(ds_c: xr.Dataset, *, use_tolerant: bool = True) -> str:
+    """Choose the raw or one-frame-tolerant clustering flag."""
+    if use_tolerant and "cluster_flag_tolerant" in ds_c:
+        return "cluster_flag_tolerant"
+    return "cluster_flag"
+
+
+def snapshot_elapsed_days(obs_idx: int, ds_like: xr.Dataset) -> float:
+    return float(ds_like["elapsed_days"].sel(obs=obs_idx).values)
+
+
+def conditional_edges(
+    flow_snapshot: xr.Dataset,
+    x_flow_var: str,
+    y_flow_var: str,
+    *,
+    nbins: int,
+    percentiles=(0.1, 99.9),
+    y_nonnegative: bool = True,
+):
+    x = np.asarray(flow_snapshot[x_flow_var].values, dtype=float)
+    y = np.asarray(flow_snapshot[y_flow_var].values, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x1 = x[mask]
+    y1 = y[mask]
+
+    p0, p1 = percentiles
+    x_min = np.nanpercentile(x1, p0)
+    x_max = np.nanpercentile(x1, p1)
+    y_min = np.nanpercentile(y1, p0)
+    y_max = np.nanpercentile(y1, p1)
+
+    if y_nonnegative:
+        y_min = max(0.0, y_min)
+
+    x_pad = 0.03 * (x_max - x_min) if x_max > x_min else 0.1
+    y_pad = 0.03 * (y_max - y_min) if y_max > y_min else 0.1
+
+    x_edges = np.linspace(x_min - x_pad, x_max + x_pad, nbins + 1)
+    y_edges = np.linspace(
+        max(0.0, y_min - y_pad) if y_nonnegative else y_min - y_pad,
+        y_max + y_pad,
+        nbins + 1,
+    )
+    return x_edges, y_edges
+
+
+def global_conditional_edges(
+    flow_dataset: xr.Dataset,
+    obs_indices: Iterable[int],
+    x_flow_var: str,
+    y_flow_var: str,
+    *,
+    nbins: int,
+    percentiles=(0.1, 99.9),
+    y_nonnegative: bool = True,
+):
+    """Determine common conditional-bin edges over selected snapshots."""
+    obs_indices = list(obs_indices)
+    x_all = np.asarray(
+        flow_dataset[x_flow_var].sel(obs=obs_indices).values,
+        dtype=float,
+    ).ravel()
+    y_all = np.asarray(
+        flow_dataset[y_flow_var].sel(obs=obs_indices).values,
+        dtype=float,
+    ).ravel()
+
+    valid = np.isfinite(x_all) & np.isfinite(y_all)
+    x_all = x_all[valid]
+    y_all = y_all[valid]
+
+    p0, p1 = percentiles
+    x_min, x_max = np.nanpercentile(x_all, [p0, p1])
+    y_min, y_max = np.nanpercentile(y_all, [p0, p1])
+
+    if y_nonnegative:
+        y_min = max(0.0, y_min)
+
+    x_padding = 0.03 * (x_max - x_min) if x_max > x_min else 0.1
+    y_padding = 0.03 * (y_max - y_min) if y_max > y_min else 0.1
+
+    x_edges = np.linspace(x_min - x_padding, x_max + x_padding, nbins + 1)
+    y_edges = np.linspace(
+        max(0.0, y_min - y_padding) if y_nonnegative else y_min - y_padding,
+        y_max + y_padding,
+        nbins + 1,
+    )
+    return x_edges, y_edges
+
+
+def conditioned_mean_2d(
+    x,
+    y,
+    z,
+    x_edges,
+    y_edges,
+    *,
+    conditioned_mean_func,
+    min_count: int,
+):
+    mean, count = conditioned_mean_func(x, y, z, x_edges, y_edges)
+    mean = np.asarray(mean, dtype=float)
+    count = np.asarray(count, dtype=float)
+    mean[count < min_count] = np.nan
+    return mean, count
+
+
+def conditional_cluster_probability_2d(
+    x,
+    y,
+    cluster_flag,
+    x_edges,
+    y_edges,
+    *,
+    min_count: int,
+):
+    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(cluster_flag)
+    x = np.asarray(x[mask], dtype=float)
+    y = np.asarray(y[mask], dtype=float)
+    c = np.asarray(cluster_flag[mask], dtype=float)
+
+    count, _, _ = np.histogram2d(x, y, bins=[x_edges, y_edges])
+    count_cluster, _, _ = np.histogram2d(
+        x,
+        y,
+        bins=[x_edges, y_edges],
+        weights=c,
+    )
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        prob = count_cluster / count
+    prob[count < min_count] = np.nan
+    return prob, count
+
+
+def particle_regime_masks(ro, strain) -> dict[str, np.ndarray]:
+    ro = np.asarray(ro, dtype=float)
+    strain = np.asarray(strain, dtype=float)
+    finite = np.isfinite(ro) & np.isfinite(strain)
+    avd = finite & (strain < np.abs(ro)) & (ro < 0.0)
+    cvd = finite & (strain < np.abs(ro)) & (ro > 0.0)
+    sd = finite & (strain >= np.abs(ro))
+    return {"AVD": avd, "SD": sd, "CVD": cvd}
+
+
+def plot_conditional_panel(
+    field2d,
+    x_edges,
+    y_edges,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    cbar_label: str,
+    plot_utils,
+    cmap="viridis",
+    vmin=None,
+    vmax=None,
+    log_color: bool = False,
+    add_ro_regimes: bool = False,
+):
+    """Plot a conditional field using the exact coupled-notebook styling."""
+    from matplotlib.colors import LogNorm
+
+    fig, ax = plt.subplots(figsize=plot_utils.get_figsize("square"), facecolor="white")
+
+    plot_kwargs = {"shading": "auto", "cmap": cmap}
+    if log_color and (vmin is not None) and (vmin > 0):
+        plot_kwargs["norm"] = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        if vmin is not None:
+            plot_kwargs["vmin"] = vmin
+        if vmax is not None:
+            plot_kwargs["vmax"] = vmax
+
+    pcm = ax.pcolormesh(x_edges, y_edges, np.asarray(field2d).T, **plot_kwargs)
+    cbar = plot_utils.add_colorbar(fig, ax, pcm)
+    cbar.set_label(cbar_label)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xlim(float(x_edges[0]), float(x_edges[-1]))
+    ax.set_ylim(float(y_edges[0]), float(y_edges[-1]))
+
+    if add_ro_regimes:
+        xx = np.linspace(x_edges[0], x_edges[-1], 500)
+        ax.plot(
+            xx,
+            np.abs(xx),
+            "--",
+            color=plot_utils.get_color("reference"),
+            lw=plot_utils._theme_attr("LINE_WIDTH", 1.2),
+            alpha=plot_utils._theme_attr("REFERENCE_ALPHA", 0.8),
+        )
+        plot_utils.add_regime_labels(ax, x_edges, y_edges)
+
+    fig.tight_layout()
+    return fig, ax
+
+
+def conditioned_geometric_mean_2d(
+    x,
+    y,
+    concentration,
+    x_edges,
+    y_edges,
+    *,
+    smoothing_sigma: float = 1.0,
+    alpha_count_scale: float = 8.0,
+):
+    """Smoothed conditional geometric mean used in the original notebook."""
+    from scipy.ndimage import gaussian_filter
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    concentration = np.asarray(concentration, dtype=float)
+
+    valid = (
+        np.isfinite(x)
+        & np.isfinite(y)
+        & np.isfinite(concentration)
+        & (concentration > 0.0)
+    )
+
+    x = x[valid]
+    y = y[valid]
+    log_c = np.log(concentration[valid])
+
+    count, _, _ = np.histogram2d(x, y, bins=[x_edges, y_edges])
+    log_sum, _, _ = np.histogram2d(
+        x,
+        y,
+        bins=[x_edges, y_edges],
+        weights=log_c,
+    )
+
+    count_smooth = gaussian_filter(count, sigma=smoothing_sigma, mode="nearest")
+    log_sum_smooth = gaussian_filter(log_sum, sigma=smoothing_sigma, mode="nearest")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_log_c = log_sum_smooth / count_smooth
+        concentration_geo = np.exp(mean_log_c)
+
+    concentration_geo[count_smooth <= 0.0] = np.nan
+    alpha = 1.0 - np.exp(-count_smooth / float(alpha_count_scale))
+    alpha = np.clip(alpha, 0.0, 1.0)
+    return concentration_geo, count_smooth, alpha
+
+
+def plot_flow_particle_overlay(
+    *,
+    flow_var: str,
+    obs_idx: int,
+    particle_tag: str,
+    coupled_outputs: dict,
+    class_style_map: dict,
+    ds_flow: xr.Dataset,
+    plot_utils,
+    plot_theme,
+    dx: float,
+    dy: float,
+    run_title_info: str,
+    rossby_limits,
+    divergence_limits,
+    plot_only_clustered_particles: bool,
+    show_all_particles_faint: bool,
+    use_tolerant_cluster_flag: bool,
+    particle_point_size: float,
+    particle_point_alpha: float,
+    faint_point_alpha: float,
+    save_figures: bool,
+    coupled_fig_dir: str | Path,
+    flow_level_tag: str,
+):
+    """Plot the original Rossby/divergence overlay without changing its style."""
+    ds_c = coupled_outputs[particle_tag]["ds"]
+    style = class_style_map[particle_tag]
+    label = coupled_outputs[particle_tag]["label"]
+    cvar = cluster_var_name(ds_c, use_tolerant=use_tolerant_cluster_flag)
+
+    flow_snapshot = ds_flow.sel(obs=obs_idx)
+    field = np.asarray(flow_snapshot[flow_var].values, dtype=float)
+    elapsed_days = float(ds_c["elapsed_days"].sel(obs=obs_idx).values)
+
+    if flow_var == "ro":
+        field_title = "Rossby number"
+        cbar_label = r"$\zeta/f$"
+        vmin, vmax = rossby_limits
+        output_group = "rossby_overlays"
+    elif flow_var == "div_f":
+        field_title = "Horizontal divergence"
+        cbar_label = r"$\delta/f$"
+        vmin, vmax = divergence_limits
+        output_group = "divergence_overlays"
+    else:
+        raise ValueError(f"Unsupported flow overlay variable: {flow_var}")
+
+    fig, ax = plot_utils.plot_map(
+        field,
+        title=f"{field_title} (t={elapsed_days:.2f} days)\n{run_title_info}",
+        cbar_label=cbar_label,
+        cmap=plot_utils.get_cmap("rossby"),
+        vmin=vmin,
+        vmax=vmax,
+        dx=dx,
+        dy=dy,
+    )
+
+    xp = np.asarray(ds_c["x_particle"].sel(obs=obs_idx).values, dtype=float)
+    yp = np.asarray(ds_c["y_particle"].sel(obs=obs_idx).values, dtype=float)
+    valid = np.isfinite(xp) & np.isfinite(yp)
+
+    clustered = (
+        np.asarray(ds_c[cvar].sel(obs=obs_idx).values, dtype=bool)
+        if cvar in ds_c
+        else np.zeros_like(valid, dtype=bool)
+    )
+    clustered &= valid
+
+    if show_all_particles_faint and not plot_only_clustered_particles:
+        ax.scatter(
+            xp[valid] / 1000.0,
+            yp[valid] / 1000.0,
+            s=0.7 * particle_point_size,
+            color="0.2",
+            alpha=faint_point_alpha,
+            linewidths=0.0,
+            label="all particles",
+            zorder=3,
+        )
+
+    scatter_mask = clustered if plot_only_clustered_particles else valid
+    scatter_label = (
+        f"{label} (clustered state)"
+        if plot_only_clustered_particles
+        else label
+    )
+
+    ax.scatter(
+        xp[scatter_mask] / 1000.0,
+        yp[scatter_mask] / 1000.0,
+        s=particle_point_size,
+        color=style["color"],
+        alpha=particle_point_alpha,
+        linewidths=0.0,
+        label=scatter_label,
+        zorder=4,
+    )
+
+    ax.legend(
+        loc="upper right",
+        fontsize=getattr(plot_theme, "LEGEND_FONTSIZE", 12),
+    )
+    fig.tight_layout()
+
+    if save_figures:
+        out_dir = Path(coupled_fig_dir) / output_group
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plot_utils.savefig_if_needed(
+            fig,
+            f"{flow_var}_{particle_tag}_{flow_level_tag}_obs{obs_idx:04d}",
+            save=True,
+            out_dir=out_dir,
+        )
+
+    plt.show()
+    return fig, ax

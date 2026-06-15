@@ -1661,7 +1661,7 @@ def plot_clustered_state_residence_pdf(
     ax.hist(vals, bins=bins, weights=weights, histtype="step", linewidth=2.0, label=label)
 
     ax.set_xlabel("Residence time [days]")
-    ax.set_ylabel("Fraction of residence events")   
+    ax.set_ylabel("Fraction of clustering events")   
     if title is not None:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
