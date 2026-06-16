@@ -1816,3 +1816,78 @@ def plot_flow_particle_overlay(
 
     plt.show()
     return fig, ax
+
+# ============================================================
+# FLOW-PARTICLE COUPLING: CONDITIONAL PDF HELPERS
+# ============================================================
+
+from matplotlib.colors import LogNorm
+
+def compute_2d_particle_pdf(x, y, x_bins, y_bins):
+    """
+    Compute a 2D particle PDF p(x, y) from particle samples.
+
+    Returns
+    -------
+    pdf_T : 2D array
+        Transposed PDF array, ready for pcolormesh(x_bins, y_bins, pdf_T).
+    counts_T : 2D array
+        Transposed raw counts per bin.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    counts, x_edges, y_edges = np.histogram2d(x, y, bins=[x_bins, y_bins])
+
+    total = counts.sum()
+
+    if total <= 0:
+        pdf = np.full_like(
+            counts,
+            np.nan,
+            dtype=float,
+        )
+    else:
+        # Fraction of all valid particles contained in each bin.
+        pdf = counts / total
+        pdf[counts == 0] = np.nan
+
+    return pdf.T, counts.T
+
+
+def draw_ro_strain_regime_guides(
+    ax,
+    x_min,
+    x_max,
+    y_max,
+    *,
+    line_color="0.4",
+    line_style="--",
+    line_width=1.2,
+    text_color="0.25",
+    text_size=18,
+):
+    """
+    Draw the regime boundaries sigma = |zeta| and add AVD / SD / CVD labels.
+    """
+    # left branch: y = -x for x <= 0
+    x_left = np.linspace(x_min, 0.0, 200)
+    y_left = -x_left
+
+    # right branch: y = x for x >= 0
+    x_right = np.linspace(0.0, x_max, 200)
+    y_right = x_right
+
+    ax.plot(x_left, y_left, line_style, color=line_color, lw=line_width)
+    ax.plot(x_right, y_right, line_style, color=line_color, lw=line_width)
+
+    ax.text(x_min + 0.10 * (x_max - x_min), 0.10 * y_max, "AVD",
+            color=text_color, fontsize=text_size, fontweight="bold")
+    ax.text(0.50 * (x_min + x_max), 0.72 * y_max, "SD",
+            color=text_color, fontsize=text_size, fontweight="bold", ha="center")
+    ax.text(x_max - 0.22 * (x_max - x_min), 0.10 * y_max, "CVD",
+            color=text_color, fontsize=text_size, fontweight="bold")
