@@ -2512,6 +2512,7 @@ def calculate_EDS_init(
     rose_scale_bands_km=None,
     rose_n_angle_bins=12,
     snapshot_index=None,
+    snapshot_range=None,
     layer_index=0,
 ):
     ds = xr.open_dataset(filepath)
@@ -2638,12 +2639,33 @@ def calculate_EDS_init(
         raise ValueError("No time dimension found in the dataset.")
 
     n_time = len(box_ds[time_coord])
+
+    if snapshot_index is not None and snapshot_range is not None:
+        raise ValueError("Use either snapshot_index or snapshot_range, not both.")
+
     if snapshot_index is not None:
         if snapshot_index < 0 or snapshot_index >= n_time:
             raise IndexError(
                 f"snapshot_index={snapshot_index} is outside the available time range 0..{n_time - 1}"
             )
         selected_time_indices = [snapshot_index]
+
+    elif snapshot_range is not None:
+        if len(snapshot_range) != 2:
+            raise ValueError("snapshot_range must contain exactly two indices: (start, end).")
+
+        range_start = int(snapshot_range[0])
+        range_end = int(snapshot_range[1])
+
+        if range_start < 0 or range_end >= n_time or range_start > range_end:
+            raise IndexError(
+                f"snapshot_range={snapshot_range} is outside the available time range "
+                f"0..{n_time - 1}, or start is larger than end."
+            )
+
+        # Inclusive range: (1, 14) selects 1, 2, ..., 14.
+        selected_time_indices = np.arange(range_start, range_end + 1)
+
     else:
         selected_time_indices = np.arange(n_time)
 
@@ -2743,12 +2765,23 @@ def calculate_EDS_init(
         mean_rose = np.empty((0, 0))
         rose_normalized = np.empty((0, 0))
 
-    if snapshot_index is None:
-        snapshot_time_index = None
-        snapshot_time_value = "all timesteps"
-    else:
+    if snapshot_index is not None:
         snapshot_time_index = int(snapshot_index)
+        snapshot_range_start = None
+        snapshot_range_end = None
         snapshot_time_value = box_ds[time_coord].isel(**{time_coord: snapshot_index}).item()
+
+    elif snapshot_range is not None:
+        snapshot_time_index = None
+        snapshot_range_start = int(snapshot_range[0])
+        snapshot_range_end = int(snapshot_range[1])
+        snapshot_time_value = f"timesteps {snapshot_range_start}-{snapshot_range_end}"
+
+    else:
+        snapshot_time_index = None
+        snapshot_range_start = None
+        snapshot_range_end = None
+        snapshot_time_value = "all timesteps"
 
     data_vars = {
         "shell_integrated_spectrum": (("wavenumber",), mean_shell),
@@ -2779,6 +2812,8 @@ def calculate_EDS_init(
             "domain_Lx_km": Lx / 1000.0,
             "domain_Ly_km": Ly / 1000.0,
             "snapshot_time_index": snapshot_time_index,
+            "snapshot_range_start": snapshot_range_start,
+            "snapshot_range_end": snapshot_range_end,
             "snapshot_time_value": snapshot_time_value,
             "layer_index": int(layer_index),
             "depth_dim": depth_dim,
