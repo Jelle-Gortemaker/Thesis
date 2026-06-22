@@ -877,7 +877,7 @@ def plot_pro_timeseries(
     figsize=None,
 ):
     """
-    Consistent local PRo time-series plot with square IDs annotated at the end.
+    Consistent local PRo time-series plot with square IDs annotated at the end
     """
     apply_plot_style()
 
@@ -889,10 +889,23 @@ def plot_pro_timeseries(
 
     cmap = get_cmap("categorical")
 
+    xmin = np.nanmin(square_pro_wide.index.values)
+    
+    if plot_time_days is not None:
+        xmax = plot_time_days
+        line_cutoff = plot_time_days - 0.8
+        text_offset = plot_time_days - 0.72 
+    else:
+        xmax = np.nanmax(square_pro_wide.index.values) + 0.8
+        line_cutoff = np.nanmax(square_pro_wide.index.values)
+        text_offset = line_cutoff + 0.08
+
     for i, sq_id in enumerate(square_pro_wide.columns):
         color = cmap((i % 20) / 19) if callable(cmap) else None
-        y = square_pro_wide[sq_id].values
-        x = square_pro_wide.index.values
+        
+        mask = square_pro_wide.index.values <= line_cutoff
+        y = square_pro_wide[sq_id].values[mask]
+        x = square_pro_wide.index.values[mask]
 
         ax.plot(
             x,
@@ -904,28 +917,17 @@ def plot_pro_timeseries(
 
         finite = np.isfinite(y)
         if np.any(finite):
-            last_idx = np.where(finite)[0][-1]
             ax.text(
-                x[last_idx] + 0.08,
-                y[last_idx],
+                text_offset,
+                y[-1],  
                 str(int(sq_id)),
                 color=color,
                 fontsize=_theme_attr("ANNOTATION_SIZE", 10),
                 va="center",
+                ha="left",
             )
-
-    if plot_time_days is not None:
-        ax.axvline(
-            plot_time_days,
-            color=get_color("reference"),
-            ls="--",
-            lw=_theme_attr("LINE_WIDTH", 1.2),
-            alpha=_theme_attr("REFERENCE_ALPHA", 0.8),
-        )
-
-    xmin = np.nanmin(square_pro_wide.index.values)
-    xmax = np.nanmax(square_pro_wide.index.values)
-    ax.set_xlim(xmin, xmax + 0.8)
+        
+    ax.set_xlim(xmin, xmax)
 
     if title == "":
         title = f"Local PRo > {format_threshold(threshold)}"
