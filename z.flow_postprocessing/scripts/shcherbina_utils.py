@@ -934,6 +934,21 @@ def plot_pro_timeseries(
 
     format_axis(ax, title=title, xlabel="time [days]", ylabel="PRo", grid=True)
 
+    ax.set_yscale("symlog", linthresh=1.0e-4, linscale=1.0, base=10)
+    ax.set_ylim(0.0, 0.5)
+    ax.set_yticks([0.0, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 5.0e-1,])
+    ax.set_yticklabels([
+        "0",
+        r"$10^{-4}$",
+        r"$10^{-3}$",
+        r"$10^{-2}$",
+        r"$10^{-1}$",
+        r"$5\times10^{-1}$",
+    ])
+    ax.grid(True, which="major", alpha=0.35)
+    ax.grid(True, which="minor", alpha=0.15)
+
+
     fig.tight_layout()
 
     return fig, ax
