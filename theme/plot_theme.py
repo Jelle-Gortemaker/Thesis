@@ -107,7 +107,7 @@ def _register_custom_cmaps() -> None:
 
     for name, cmap in custom_maps.items():
         try:
-            mpl.colormaps.register(cmap, name=name, force=True)
+            mpl.colormaps.register(cmap, name=name)
         except TypeError:
             # Older Matplotlib versions may not support force=True.
             try:
