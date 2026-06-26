@@ -1,26 +1,28 @@
 """
-Slow-manifold Maxey--Riley kernels for flat MITgcm/Parcels simulations.
+Slow-manifold Maxey-Riley kernels for flat MITgcm/Parcels simulations.
 
-This file contains only the prescribed effective-inertia dynamics.
+This file intentionally contains only the MR-SM inertial-particle dynamics.
 Passive tracer advection lives in kernels_passive.py.
 """
+
+import math
 
 
 def advection_mr_sm_rk4(particle, fieldset, time):
     """
-    First-order horizontal slow-manifold advection.
+    Slow-manifold inertial advection using a manually prescribed effective
+    response time tau_p.
 
-    The kernel uses the prescribed effective coefficient tau_eff:
+    The effective particle velocity is:
 
-        u_p = U + tau_eff * (DU/Dt - f0 V)
-        v_p = V + tau_eff * (DV/Dt + f0 U)
+        u_p = U + tau_p * (DU/Dt - f0 V)
+        v_p = V + tau_p * (DV/Dt + f0 U)
 
-    tau_eff is stored in particle.tau_eff_nominal. The physical Stokes
-    relaxation time tau_s is used outside this kernel to calculate the
-    reported physical Stokes number St_s = tau_s / T_f.
+    Here tau_p is supplied directly by the user. Diameter, buoyancy,
+    viscosity, Rep, and drag corrections are not used by default.
     """
 
-    tau_eff = particle.tau_eff_nominal
+    tau = particle.tau_p
 
     # ============================================================
     # RK4 stage 1
@@ -38,8 +40,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt1 = dudt1 + uf1 * dudx1 + vf1 * dudy1
     DvDt1 = dvdt1 + uf1 * dvdx1 + vf1 * dvdy1
 
-    u1 = uf1 + tau_eff * (DuDt1 - fieldset.f0 * vf1)
-    v1 = vf1 + tau_eff * (DvDt1 + fieldset.f0 * uf1)
+    u1 = uf1 + tau * (DuDt1 - fieldset.f0 * vf1)
+    v1 = vf1 + tau * (DvDt1 + fieldset.f0 * uf1)
 
     lon1 = particle.lon + 0.5 * particle.dt * u1
     lat1 = particle.lat + 0.5 * particle.dt * v1
@@ -61,8 +63,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt2 = dudt2 + uf2 * dudx2 + vf2 * dudy2
     DvDt2 = dvdt2 + uf2 * dvdx2 + vf2 * dvdy2
 
-    u2 = uf2 + tau_eff * (DuDt2 - fieldset.f0 * vf2)
-    v2 = vf2 + tau_eff * (DvDt2 + fieldset.f0 * uf2)
+    u2 = uf2 + tau * (DuDt2 - fieldset.f0 * vf2)
+    v2 = vf2 + tau * (DvDt2 + fieldset.f0 * uf2)
 
     lon2 = particle.lon + 0.5 * particle.dt * u2
     lat2 = particle.lat + 0.5 * particle.dt * v2
@@ -84,8 +86,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt3 = dudt3 + uf3 * dudx3 + vf3 * dudy3
     DvDt3 = dvdt3 + uf3 * dvdx3 + vf3 * dvdy3
 
-    u3 = uf3 + tau_eff * (DuDt3 - fieldset.f0 * vf3)
-    v3 = vf3 + tau_eff * (DvDt3 + fieldset.f0 * uf3)
+    u3 = uf3 + tau * (DuDt3 - fieldset.f0 * vf3)
+    v3 = vf3 + tau * (DvDt3 + fieldset.f0 * uf3)
 
     lon3 = particle.lon + particle.dt * u3
     lat3 = particle.lat + particle.dt * v3
@@ -107,8 +109,8 @@ def advection_mr_sm_rk4(particle, fieldset, time):
     DuDt4 = dudt4 + uf4 * dudx4 + vf4 * dudy4
     DvDt4 = dvdt4 + uf4 * dvdx4 + vf4 * dvdy4
 
-    u4 = uf4 + tau_eff * (DuDt4 - fieldset.f0 * vf4)
-    v4 = vf4 + tau_eff * (DvDt4 + fieldset.f0 * uf4)
+    u4 = uf4 + tau * (DuDt4 - fieldset.f0 * vf4)
+    v4 = vf4 + tau * (DvDt4 + fieldset.f0 * uf4)
 
     # ============================================================
     # Final RK4 update and diagnostics
@@ -121,3 +123,5 @@ def advection_mr_sm_rk4(particle, fieldset, time):
 
     particle.uslip = particle.up - uf4
     particle.vslip = particle.vp - vf4
+    particle.Rep = 0.0
+    particle.C_Rep_current = 1.0

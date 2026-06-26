@@ -106,10 +106,14 @@ def _register_custom_cmaps() -> None:
     }
 
     for name, cmap in custom_maps.items():
-        # Repeated theme calls must not re-register an existing colormap.
-        if name in mpl.colormaps:
-            continue
-        mpl.colormaps.register(cmap, name=name)
+        try:
+            mpl.colormaps.register(cmap, name=name)
+        except TypeError:
+            # Older Matplotlib versions may not support force=True.
+            try:
+                mpl.colormaps.register(cmap, name=name)
+            except ValueError:
+                pass
 
 
 # ============================================================
