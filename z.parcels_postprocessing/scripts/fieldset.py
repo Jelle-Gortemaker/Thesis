@@ -426,25 +426,3 @@ def summarize_dataset(path: str | Path) -> dict:
         "u_dims": ds["UVEL"].dims,
         "v_dims": ds["VVEL"].dims,
     }
-
-
-def quick_qc_parcels_input(ds: xr.Dataset) -> dict:
-    qc = {
-        "dims": dict(ds.sizes),
-        "coords": list(ds.coords),
-        "data_vars": list(ds.data_vars),
-        "U_dims": ds["U"].dims,
-        "V_dims": ds["V"].dims,
-        "U_shape": tuple(ds["U"].shape),
-        "V_shape": tuple(ds["V"].shape),
-        "x_min": float(ds["x"].min()),
-        "x_max": float(ds["x"].max()),
-        "y_min": float(ds["y"].min()),
-        "y_max": float(ds["y"].max()),
-        "time0": float(ds["time"].values[0]),
-        "time_last": float(ds["time"].values[-1]),
-        "dt_head": np.diff(ds["time"].values[:5]).tolist(),
-        "U_nan_fraction_t0": float(np.isnan(ds["U"].isel(time=0)).mean()),
-        "V_nan_fraction_t0": float(np.isnan(ds["V"].isel(time=0)).mean()),
-    }
-    return qc
