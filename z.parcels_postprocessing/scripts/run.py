@@ -74,14 +74,14 @@ class RunConfig:
     save_metadata_sidecar: bool = True
 
 
-def _safe_number(x: float, precision: int = 4) -> str:
-    """File-name safe numeric formatting."""
-    if x is None:
-        return "none"
-    if not np.isfinite(float(x)):
-        return "nan"
-    s = f"{float(x):.{precision}g}"
-    return s.replace("-", "m").replace("+", "").replace(".", "p")
+# def _safe_number(x: float, precision: int = 4) -> str:
+#     """File-name safe numeric formatting."""
+#     if x is None:
+#         return "none"
+#     if not np.isfinite(float(x)):
+#         return "nan"
+#     s = f"{float(x):.{precision}g}"
+#     return s.replace("-", "m").replace("+", "").replace(".", "p")
 
 
 def _format_tau_label(tau_seconds: float) -> str:
@@ -188,54 +188,54 @@ def prepare_release(config: RunConfig, ds: xr.Dataset) -> tuple[np.ndarray, np.n
     raise ValueError(f"Unknown release_mode: {config.release_mode}")
 
 
-def _get_release_time(fieldset, release_time_index: int) -> float:
-    times = np.asarray(fieldset.U.grid.time, dtype=float)
+# def _get_release_time(fieldset, release_time_index: int) -> float:
+#     times = np.asarray(fieldset.U.grid.time, dtype=float)
 
-    if release_time_index < 0 or release_time_index >= len(times):
-        raise IndexError(
-            f"release_time_index={release_time_index} is out of range "
-            f"for {len(times)} available forcing times."
-        )
+#     if release_time_index < 0 or release_time_index >= len(times):
+#         raise IndexError(
+#             f"release_time_index={release_time_index} is out of range "
+#             f"for {len(times)} available forcing times."
+#         )
 
-    return float(times[release_time_index])
-
-
-def _check_runtime_available(fieldset, release_time: float, runtime_seconds: float) -> None:
-    times = np.asarray(fieldset.U.grid.time, dtype=float)
-    last_time = float(times[-1])
-    requested_end = release_time + runtime_seconds
-
-    if requested_end > last_time:
-        available_days = (last_time - release_time) / 86400.0
-        requested_days = runtime_seconds / 86400.0
-        raise ValueError(
-            "Requested runtime is too long for the available velocity forcing.\n"
-            f"Requested: {requested_days:.2f} days after release.\n"
-            f"Available: {available_days:.2f} days after release.\n"
-            "Reduce runtime_days or choose an earlier release_time_index."
-        )
+#     return float(times[release_time_index])
 
 
-def _sample_initial_fluid_velocity(
-    ds: xr.Dataset,
-    lon0: np.ndarray,
-    lat0: np.ndarray,
-    release_time_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    points = xr.DataArray(np.arange(len(lon0)), dims="particle")
-    lon_da = xr.DataArray(lon0, dims="particle", coords={"particle": points})
-    lat_da = xr.DataArray(lat0, dims="particle", coords={"particle": points})
+# def _check_runtime_available(fieldset, release_time: float, runtime_seconds: float) -> None:
+#     times = np.asarray(fieldset.U.grid.time, dtype=float)
+#     last_time = float(times[-1])
+#     requested_end = release_time + runtime_seconds
 
-    U0 = ds["U"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
-    V0 = ds["V"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
+#     if requested_end > last_time:
+#         available_days = (last_time - release_time) / 86400.0
+#         requested_days = runtime_seconds / 86400.0
+#         raise ValueError(
+#             "Requested runtime is too long for the available velocity forcing.\n"
+#             f"Requested: {requested_days:.2f} days after release.\n"
+#             f"Available: {available_days:.2f} days after release.\n"
+#             "Reduce runtime_days or choose an earlier release_time_index."
+#         )
 
-    U0 = np.asarray(U0, dtype=float)
-    V0 = np.asarray(V0, dtype=float)
 
-    U0 = np.where(np.isfinite(U0), U0, 0.0)
-    V0 = np.where(np.isfinite(V0), V0, 0.0)
+# def _sample_initial_fluid_velocity(
+#     ds: xr.Dataset,
+#     lon0: np.ndarray,
+#     lat0: np.ndarray,
+#     release_time_index: int,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     points = xr.DataArray(np.arange(len(lon0)), dims="particle")
+#     lon_da = xr.DataArray(lon0, dims="particle", coords={"particle": points})
+#     lat_da = xr.DataArray(lat0, dims="particle", coords={"particle": points})
 
-    return U0, V0
+#     U0 = ds["U"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
+#     V0 = ds["V"].isel(time=release_time_index).interp(x=lon_da, y=lat_da).values
+
+#     U0 = np.asarray(U0, dtype=float)
+#     V0 = np.asarray(V0, dtype=float)
+
+#     U0 = np.where(np.isfinite(U0), U0, 0.0)
+#     V0 = np.where(np.isfinite(V0), V0, 0.0)
+
+#     return U0, V0
 
 
 def particle_class_parameters(config: RunConfig) -> dict:
@@ -311,34 +311,17 @@ def _json_ready(value):
     return value
 
 
-def _write_metadata_sidecar(output_path: Path, info: dict) -> Path:
-    metadata_path = _metadata_path_for_output(output_path)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+# def _write_metadata_sidecar(output_path: Path, info: dict) -> Path:
+#     metadata_path = _metadata_path_for_output(output_path)
+#     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
-    clean = {key: _json_ready(value) for key, value in info.items()}
+#     clean = {key: _json_ready(value) for key, value in info.items()}
 
-    with open(metadata_path, "w") as f:
-        json.dump(clean, f, indent=2)
+#     with open(metadata_path, "w") as f:
+#         json.dump(clean, f, indent=2)
 
-    return metadata_path
+#     return metadata_path
 
-
-def _add_attrs_to_zarr_if_possible(output_path: Path, info: dict) -> None:
-    """Best-effort storage of labels/metadata in the trajectory dataset attrs."""
-    try:
-        import zarr
-
-        if output_path.suffix != ".zarr" or not output_path.exists():
-            return
-
-        root = zarr.open_group(str(output_path), mode="a")
-        for key, value in info.items():
-            value = _json_ready(value)
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                root.attrs[key] = value
-    except Exception:
-        # The JSON sidecar is the authoritative metadata store.
-        return
 
 def load_trajectories(path: str | Path) -> xr.Dataset:
     return open_trajectory_dataset(path)

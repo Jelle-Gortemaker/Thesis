@@ -2515,310 +2515,944 @@ def calculate_EDS_init(
     snapshot_range=None,
     layer_index=0,
 ):
+    """
+    Calculate horizontal kinetic-energy spectra from MITgcm UVEL/VVEL.
+
+    This version retains the same spectral calculation and returned
+    variables as the previous implementation, but avoids applying
+    xarray.interp() to the complete time series simultaneously.
+
+    For the regular Cartesian MITgcm C-grid used here, tracer-cell
+    coordinates are located halfway between adjacent staggered velocity
+    coordinates. Therefore:
+
+        U_center = 0.5 * (U[i] + U[i+1])
+        V_center = 0.5 * (V[j] + V[j+1])
+
+    is exactly equivalent to linear interpolation from Xp1 -> X and
+    Yp1 -> Y, while requiring much less memory.
+    """
+
     ds = xr.open_dataset(filepath)
     print(ds)
 
-    # Step 1: Automatically determine the correct dimension for depth
+    # ============================================================
+    # 1. IDENTIFY DIMENSIONS AND COORDINATES
+    # ============================================================
+
     depth_dim = None
+
     for dim in ds.dims:
         if "Z" in dim or "depth" in dim.lower():
             depth_dim = dim
             break
 
     if depth_dim is None:
+        ds.close()
         raise ValueError("No depth-like dimension found in the dataset.")
 
-    # Check what depth dimension is used
     print(f"Depth dimension: {depth_dim}")
 
-    # Validate requested vertical layer
     n_layers = ds.sizes[depth_dim]
+
     if layer_index < 0 or layer_index >= n_layers:
+        ds.close()
         raise IndexError(
-            f"layer_index={layer_index} is outside the available range 0..{n_layers - 1}"
+            f"layer_index={layer_index} is outside the available "
+            f"range 0..{n_layers - 1}"
         )
 
     print(f"Selected layer index: {layer_index}")
 
-    # Select requested vertical layer
-    if target_box is None:
-        box_ds = ds.isel({depth_dim: layer_index})
+    # Horizontal tracer coordinates
+    if "X" in ds.coords:
+        x_coord = "X"
+    elif "x" in ds.coords:
+        x_coord = "x"
     else:
-        x_coord = 'X' if 'X' in ds.coords else 'x'
-        y_coord = 'Y' if 'Y' in ds.coords else 'y'
-        box_ds = ds.sel(
-            **{
-                x_coord: slice(target_box[0], target_box[1]),
-                y_coord: slice(target_box[2], target_box[3]),
-            }
-        ).isel({depth_dim: layer_index})
+        ds.close()
+        raise ValueError("No X coordinate found in the dataset.")
 
-    box_ds['UVEL'] = box_ds['UVEL'].interp(Xp1=box_ds['X'])
-    box_ds['VVEL'] = box_ds['VVEL'].interp(Yp1=box_ds['Y'])
+    if "Y" in ds.coords:
+        y_coord = "Y"
+    elif "y" in ds.coords:
+        y_coord = "y"
+    else:
+        ds.close()
+        raise ValueError("No Y coordinate found in the dataset.")
 
-    print(f"Selected box shape UVEL: {box_ds['UVEL'].shape}")
-    print(f"Selected box shape VVEL: {box_ds['VVEL'].shape}")
+    # Time coordinate
+    if "T" in ds.dims:
+        time_coord = "T"
+    elif "time" in ds.dims:
+        time_coord = "time"
+    else:
+        ds.close()
+        raise ValueError("No time dimension found in the dataset.")
 
-    x_coord = 'X'
-    y_coord = 'Y'
-    x = box_ds[x_coord].values
-    y = box_ds[y_coord].values
+    # ============================================================
+    # 2. SELECT VERTICAL LAYER
+    # ============================================================
 
-    if x_res is None:
-        x_res = float(np.abs(np.mean(np.gradient(x))))
-    if y_res is None:
-        y_res = float(np.abs(np.mean(np.gradient(y))))
+    layer_ds = ds.isel({depth_dim: layer_index})
 
-    dx = x_res
-    dy = y_res
+    # Full tracer-grid coordinates
+    x_all = np.asarray(layer_ds[x_coord].values, dtype=float)
+    y_all = np.asarray(layer_ds[y_coord].values, dtype=float)
+
+    # ============================================================
+    # 3. SELECT OPTIONAL HORIZONTAL BOX
+    # ============================================================
+
+    if target_box is None:
+
+        x_indices = np.arange(x_all.size)
+        y_indices = np.arange(y_all.size)
+
+    else:
+
+        x_min = min(target_box[0], target_box[1])
+        x_max = max(target_box[0], target_box[1])
+
+        y_min = min(target_box[2], target_box[3])
+        y_max = max(target_box[2], target_box[3])
+
+        x_indices = np.where(
+            (x_all >= x_min) & (x_all <= x_max)
+        )[0]
+
+        y_indices = np.where(
+            (y_all >= y_min) & (y_all <= y_max)
+        )[0]
+
+        if x_indices.size == 0:
+            ds.close()
+            raise ValueError(
+                "target_box does not contain any X grid cells."
+            )
+
+        if y_indices.size == 0:
+            ds.close()
+            raise ValueError(
+                "target_box does not contain any Y grid cells."
+            )
+
+    x = x_all[x_indices]
+    y = y_all[y_indices]
+
     nx = len(x)
     ny = len(y)
+
+    # ============================================================
+    # 4. GRID SPACING
+    # ============================================================
+
+    if x_res is None:
+        x_res = float(
+            np.abs(np.mean(np.gradient(x)))
+        )
+
+    if y_res is None:
+        y_res = float(
+            np.abs(np.mean(np.gradient(y)))
+        )
+
+    dx = float(x_res)
+    dy = float(y_res)
 
     Lx = nx * dx
     Ly = ny * dy
 
+    print(
+        f"Selected centered horizontal shape: "
+        f"({ny}, {nx})"
+    )
+
+    print(
+        f"Grid spacing: dx={dx:g} m, dy={dy:g} m"
+    )
+
+    # ============================================================
+    # 5. SELECT TIMESTEPS
+    # ============================================================
+
+    n_time = layer_ds.sizes[time_coord]
+
+    if (
+        snapshot_index is not None
+        and snapshot_range is not None
+    ):
+        ds.close()
+        raise ValueError(
+            "Use either snapshot_index or snapshot_range, "
+            "not both."
+        )
+
+    if snapshot_index is not None:
+
+        snapshot_index = int(snapshot_index)
+
+        if (
+            snapshot_index < 0
+            or snapshot_index >= n_time
+        ):
+            ds.close()
+            raise IndexError(
+                f"snapshot_index={snapshot_index} is outside "
+                f"the available time range 0..{n_time - 1}"
+            )
+
+        selected_time_indices = np.array(
+            [snapshot_index],
+            dtype=int,
+        )
+
+    elif snapshot_range is not None:
+
+        if len(snapshot_range) != 2:
+            ds.close()
+            raise ValueError(
+                "snapshot_range must contain exactly two "
+                "indices: (start, end)."
+            )
+
+        range_start = int(snapshot_range[0])
+        range_end = int(snapshot_range[1])
+
+        if (
+            range_start < 0
+            or range_end >= n_time
+            or range_start > range_end
+        ):
+            ds.close()
+            raise IndexError(
+                f"snapshot_range={snapshot_range} is outside "
+                f"the available time range 0..{n_time - 1}, "
+                "or start is larger than end."
+            )
+
+        # Inclusive range:
+        # (1, 14) selects 1, 2, ..., 14
+        selected_time_indices = np.arange(
+            range_start,
+            range_end + 1,
+            dtype=int,
+        )
+
+    else:
+
+        selected_time_indices = np.arange(
+            n_time,
+            dtype=int,
+        )
+
+    print(
+        f"Number of selected timesteps: "
+        f"{len(selected_time_indices)}"
+    )
+
+    # ============================================================
+    # 6. WAVENUMBER GRID
+    # ============================================================
+
     kx = np.fft.fftfreq(nx, d=dx)
     ky = np.fft.fftfreq(ny, d=dy)
-    kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="xy")
 
-    k_mag = np.sqrt(kx_grid**2 + ky_grid**2)
-    theta_rad = np.arctan2(ky_grid, kx_grid)
+    kx_grid, ky_grid = np.meshgrid(
+        kx,
+        ky,
+        indexing="xy",
+    )
+
+    k_mag = np.sqrt(
+        kx_grid**2
+        + ky_grid**2
+    )
+
+    theta_rad = np.arctan2(
+        ky_grid,
+        kx_grid,
+    )
 
     valid_k = k_mag > 0
+
     if not np.any(valid_k):
-        raise ValueError("No valid nonzero wavenumbers found.")
+        ds.close()
+        raise ValueError(
+            "No valid nonzero wavenumbers found."
+        )
 
     natural_lambda_max = min(Lx, Ly)
+
     if max_wavelength_km is None:
         lambda_max = natural_lambda_max
+
     else:
-        lambda_max = min(max_wavelength_km * 1000.0, natural_lambda_max)
+        lambda_max = min(
+            max_wavelength_km * 1000.0,
+            natural_lambda_max,
+        )
 
     k_min = 1.0 / lambda_max
     k_max = np.nanmax(k_mag[valid_k])
 
     if k_min >= k_max:
-        raise ValueError("Selected max wavelength is too small relative to the domain/grid.")
+        ds.close()
+        raise ValueError(
+            "Selected max wavelength is too small "
+            "relative to the domain/grid."
+        )
 
-    k_bins = np.logspace(np.log10(k_min), np.log10(k_max), num=n_bins + 1)
-    k_centers = np.sqrt(k_bins[:-1] * k_bins[1:])
+    k_bins = np.logspace(
+        np.log10(k_min),
+        np.log10(k_max),
+        num=n_bins + 1,
+    )
+
+    k_centers = np.sqrt(
+        k_bins[:-1]
+        * k_bins[1:]
+    )
+
     dk = np.diff(k_bins)
 
+    # ============================================================
+    # 7. PRECOMPUTE SHELL MASKS
+    # ============================================================
+
     shell_masks = []
-    shell_mode_count = np.zeros(n_bins, dtype=int)
+    shell_mode_count = np.zeros(
+        n_bins,
+        dtype=int,
+    )
+
     for i in range(n_bins):
-        shell = (k_mag >= k_bins[i]) & (k_mag < k_bins[i + 1])
+
+        shell = (
+            (k_mag >= k_bins[i])
+            & (k_mag < k_bins[i + 1])
+        )
+
         shell_masks.append(shell)
-        shell_mode_count[i] = int(np.sum(shell))
 
-    rose_enabled = rose_scale_bands_km is not None and len(rose_scale_bands_km) > 0
+        shell_mode_count[i] = int(
+            np.sum(shell)
+        )
+
+    # ============================================================
+    # 8. OPTIONAL ROSE-SPECTRUM SETUP
+    # ============================================================
+
+    rose_enabled = (
+        rose_scale_bands_km is not None
+        and len(rose_scale_bands_km) > 0
+    )
+
     if rose_enabled:
-        rose_scale_bands_km = [tuple(b) for b in rose_scale_bands_km]
-        n_rose_bands = len(rose_scale_bands_km)
 
-        rose_angle_edges_deg = np.linspace(-180.0, 180.0, rose_n_angle_bins + 1)
-        rose_angle_centers_deg = 0.5 * (rose_angle_edges_deg[:-1] + rose_angle_edges_deg[1:])
+        rose_scale_bands_km = [
+            tuple(b)
+            for b in rose_scale_bands_km
+        ]
+
+        n_rose_bands = len(
+            rose_scale_bands_km
+        )
+
+        rose_angle_edges_deg = np.linspace(
+            -180.0,
+            180.0,
+            rose_n_angle_bins + 1,
+        )
+
+        rose_angle_centers_deg = (
+            0.5
+            * (
+                rose_angle_edges_deg[:-1]
+                + rose_angle_edges_deg[1:]
+            )
+        )
 
         rose_band_masks = []
         rose_band_labels = []
 
-        for lam_hi_km, lam_lo_km in rose_scale_bands_km:
-            k_lo = 1.0 / (lam_hi_km * 1000.0)
-            k_hi = 1.0 / (lam_lo_km * 1000.0)
-            rose_band_masks.append((k_mag >= k_lo) & (k_mag < k_hi))
-            rose_band_labels.append(f"{lam_hi_km:g}-{lam_lo_km:g} km")
+        for (
+            lam_hi_km,
+            lam_lo_km,
+        ) in rose_scale_bands_km:
+
+            k_lo = (
+                1.0
+                / (lam_hi_km * 1000.0)
+            )
+
+            k_hi = (
+                1.0
+                / (lam_lo_km * 1000.0)
+            )
+
+            rose_band_masks.append(
+                (k_mag >= k_lo)
+                & (k_mag < k_hi)
+            )
+
+            rose_band_labels.append(
+                f"{lam_hi_km:g}-"
+                f"{lam_lo_km:g} km"
+            )
+
     else:
+
         n_rose_bands = 0
-        rose_angle_edges_deg = np.array([])
-        rose_angle_centers_deg = np.array([])
+
+        rose_angle_edges_deg = (
+            np.array([])
+        )
+
+        rose_angle_centers_deg = (
+            np.array([])
+        )
+
         rose_band_masks = []
         rose_band_labels = []
 
-    time_coord = 'T' if 'T' in box_ds.dims else ('time' if 'time' in box_ds.dims else None)
-    if time_coord is None:
-        raise ValueError("No time dimension found in the dataset.")
-
-    n_time = len(box_ds[time_coord])
-
-    if snapshot_index is not None and snapshot_range is not None:
-        raise ValueError("Use either snapshot_index or snapshot_range, not both.")
-
-    if snapshot_index is not None:
-        if snapshot_index < 0 or snapshot_index >= n_time:
-            raise IndexError(
-                f"snapshot_index={snapshot_index} is outside the available time range 0..{n_time - 1}"
-            )
-        selected_time_indices = [snapshot_index]
-
-    elif snapshot_range is not None:
-        if len(snapshot_range) != 2:
-            raise ValueError("snapshot_range must contain exactly two indices: (start, end).")
-
-        range_start = int(snapshot_range[0])
-        range_end = int(snapshot_range[1])
-
-        if range_start < 0 or range_end >= n_time or range_start > range_end:
-            raise IndexError(
-                f"snapshot_range={snapshot_range} is outside the available time range "
-                f"0..{n_time - 1}, or start is larger than end."
-            )
-
-        # Inclusive range: (1, 14) selects 1, 2, ..., 14.
-        selected_time_indices = np.arange(range_start, range_end + 1)
-
-    else:
-        selected_time_indices = np.arange(n_time)
+    # ============================================================
+    # 9. CALCULATE SPECTRUM FOR EACH REQUESTED SNAPSHOT
+    # ============================================================
 
     spectra_shell = []
     spectra_density = []
     spectra_axis_complex = []
     rose_snapshots = []
 
-    for t in selected_time_indices:
-        u = np.nan_to_num(box_ds["UVEL"].isel(**{time_coord: t}).values, nan=0.0)
-        v = np.nan_to_num(box_ds["VVEL"].isel(**{time_coord: t}).values, nan=0.0)
+    N = nx * ny
 
+    for t in selected_time_indices:
+
+        # --------------------------------------------------------
+        # Load U on its staggered Xp1 grid.
+        #
+        # Only the requested timestep and Y rows are loaded.
+        # Xp1 is kept complete initially so adjacent faces can
+        # be averaged onto the tracer-cell centers.
+        # --------------------------------------------------------
+
+        u_stag = layer_ds["UVEL"].isel(
+            {
+                time_coord: int(t),
+                y_coord: y_indices,
+            }
+        ).values
+
+        # --------------------------------------------------------
+        # Load V on its staggered Yp1 grid.
+        #
+        # Only the requested timestep and X columns are loaded.
+        # --------------------------------------------------------
+
+        v_stag = layer_ds["VVEL"].isel(
+            {
+                time_coord: int(t),
+                x_coord: x_indices,
+            }
+        ).values
+
+        # Use float64, matching the numerical precision produced
+        # by xarray's interpolation routine.
+        u_stag = np.asarray(
+            u_stag,
+            dtype=np.float64,
+        )
+
+        v_stag = np.asarray(
+            v_stag,
+            dtype=np.float64,
+        )
+
+        # --------------------------------------------------------
+        # MITgcm C-grid -> tracer-cell centers
+        #
+        # For the regular Cartesian grid:
+        #
+        # X[i] = 0.5 * (Xp1[i] + Xp1[i+1])
+        # Y[j] = 0.5 * (Yp1[j] + Yp1[j+1])
+        #
+        # Therefore this is equivalent to the previous linear
+        # xarray interpolation.
+        # --------------------------------------------------------
+
+        u_center_full = 0.5 * (
+            u_stag[:, :-1]
+            + u_stag[:, 1:]
+        )
+
+        v_center_full = 0.5 * (
+            v_stag[:-1, :]
+            + v_stag[1:, :]
+        )
+
+        # Select requested X columns for U.
+        u = u_center_full[
+            :,
+            x_indices,
+        ]
+
+        # Select requested Y rows for V.
+        v = v_center_full[
+            y_indices,
+            :,
+        ]
+
+        # Safety check
+        if u.shape != (ny, nx):
+            ds.close()
+            raise ValueError(
+                f"Centered UVEL has shape {u.shape}; "
+                f"expected {(ny, nx)}."
+            )
+
+        if v.shape != (ny, nx):
+            ds.close()
+            raise ValueError(
+                f"Centered VVEL has shape {v.shape}; "
+                f"expected {(ny, nx)}."
+            )
+
+        # Same NaN treatment as before
+        u = np.nan_to_num(
+            u,
+            nan=0.0,
+        )
+
+        v = np.nan_to_num(
+            v,
+            nan=0.0,
+        )
+
+        # Same mean-removal procedure as before
         if remove_mean:
             u = u - np.mean(u)
             v = v - np.mean(v)
 
+        # --------------------------------------------------------
+        # SAME FFT CALCULATION AS PREVIOUS FUNCTION
+        # --------------------------------------------------------
+
         u_hat = np.fft.fft2(u)
         v_hat = np.fft.fft2(v)
 
-        N = nx * ny
-        ke_2d = 0.5 * (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (N ** 2)
+        ke_2d = (
+            0.5
+            * (
+                np.abs(u_hat) ** 2
+                + np.abs(v_hat) ** 2
+            )
+            / (N ** 2)
+        )
 
-        shell_spectrum = np.full(n_bins, np.nan)
-        density_spectrum = np.full(n_bins, np.nan)
-        axis_complex = np.full(n_bins, np.nan + 1j * np.nan, dtype=complex)
+        shell_spectrum = np.full(
+            n_bins,
+            np.nan,
+        )
+
+        density_spectrum = np.full(
+            n_bins,
+            np.nan,
+        )
+
+        axis_complex = np.full(
+            n_bins,
+            np.nan + 1j * np.nan,
+            dtype=complex,
+        )
 
         for i in range(n_bins):
+
             shell = shell_masks[i]
-            if shell_mode_count[i] < min_modes_per_bin:
+
+            if (
+                shell_mode_count[i]
+                < min_modes_per_bin
+            ):
                 continue
 
             shell_energy = ke_2d[shell]
             shell_theta = theta_rad[shell]
-            shell_sum = np.nansum(shell_energy)
 
-            if not np.isfinite(shell_sum) or shell_sum <= 0:
+            shell_sum = np.nansum(
+                shell_energy
+            )
+
+            if (
+                not np.isfinite(shell_sum)
+                or shell_sum <= 0
+            ):
                 continue
 
-            shell_spectrum[i] = shell_sum
-            density_spectrum[i] = shell_sum / dk[i]
-            axis_complex[i] = np.nansum(shell_energy * np.exp(2j * shell_theta)) / shell_sum
+            shell_spectrum[i] = (
+                shell_sum
+            )
 
-        spectra_shell.append(shell_spectrum)
-        spectra_density.append(density_spectrum)
-        spectra_axis_complex.append(axis_complex)
+            density_spectrum[i] = (
+                shell_sum / dk[i]
+            )
+
+            axis_complex[i] = (
+                np.nansum(
+                    shell_energy
+                    * np.exp(
+                        2j * shell_theta
+                    )
+                )
+                / shell_sum
+            )
+
+        spectra_shell.append(
+            shell_spectrum
+        )
+
+        spectra_density.append(
+            density_spectrum
+        )
+
+        spectra_axis_complex.append(
+            axis_complex
+        )
+
+        # --------------------------------------------------------
+        # SAME ROSE-SPECTRUM CALCULATION AS BEFORE
+        # --------------------------------------------------------
 
         if rose_enabled:
-            rose_band_energy = np.full((n_rose_bands, rose_n_angle_bins), np.nan)
-            for b, band_mask in enumerate(rose_band_masks):
-                band_energy = ke_2d[band_mask]
-                band_theta = np.rad2deg(theta_rad[band_mask])
-                band_sum = np.nansum(band_energy)
 
-                if not np.isfinite(band_sum) or band_sum <= 0:
+            rose_band_energy = np.full(
+                (
+                    n_rose_bands,
+                    rose_n_angle_bins,
+                ),
+                np.nan,
+            )
+
+            for (
+                b,
+                band_mask,
+            ) in enumerate(
+                rose_band_masks
+            ):
+
+                band_energy = (
+                    ke_2d[band_mask]
+                )
+
+                band_theta = np.rad2deg(
+                    theta_rad[band_mask]
+                )
+
+                band_sum = np.nansum(
+                    band_energy
+                )
+
+                if (
+                    not np.isfinite(band_sum)
+                    or band_sum <= 0
+                ):
                     continue
 
-                vals = np.zeros(rose_n_angle_bins, dtype=float)
-                for j in range(rose_n_angle_bins):
-                    m = (band_theta >= rose_angle_edges_deg[j]) & (
-                        band_theta < rose_angle_edges_deg[j + 1]
+                vals = np.zeros(
+                    rose_n_angle_bins,
+                    dtype=float,
+                )
+
+                for j in range(
+                    rose_n_angle_bins
+                ):
+
+                    m = (
+                        band_theta
+                        >= rose_angle_edges_deg[j]
+                    ) & (
+                        band_theta
+                        < rose_angle_edges_deg[j + 1]
                     )
-                    vals[j] = np.nansum(band_energy[m]) if np.any(m) else 0.0
 
-                rose_band_energy[b, :] = vals
+                    vals[j] = (
+                        np.nansum(
+                            band_energy[m]
+                        )
+                        if np.any(m)
+                        else 0.0
+                    )
 
-            rose_snapshots.append(rose_band_energy)
+                rose_band_energy[
+                    b,
+                    :,
+                ] = vals
 
-    spectra_shell = np.asarray(spectra_shell)
-    spectra_density = np.asarray(spectra_density)
-    spectra_axis_complex = np.asarray(spectra_axis_complex)
+            rose_snapshots.append(
+                rose_band_energy
+            )
+
+    # ============================================================
+    # 10. CONVERT SNAPSHOT RESULTS TO ARRAYS
+    # ============================================================
+
+    spectra_shell = np.asarray(
+        spectra_shell
+    )
+
+    spectra_density = np.asarray(
+        spectra_density
+    )
+
+    spectra_axis_complex = np.asarray(
+        spectra_axis_complex
+    )
 
     if rose_enabled:
-        rose_snapshots = np.asarray(rose_snapshots)
+
+        rose_snapshots = np.asarray(
+            rose_snapshots
+        )
+
     else:
-        rose_snapshots = np.empty((0, 0, 0))
 
-    mean_shell = np.nanmean(spectra_shell, axis=0)
-    std_shell = np.nanstd(spectra_shell, axis=0)
+        rose_snapshots = np.empty(
+            (0, 0, 0)
+        )
 
-    mean_density = np.nanmean(spectra_density, axis=0)
-    std_density = np.nanstd(spectra_density, axis=0)
+    # ============================================================
+    # 11. TEMPORAL MEAN AND STANDARD DEVIATION
+    # ============================================================
 
-    mean_axis = np.nanmean(spectra_axis_complex, axis=0)
-    anisotropy_strength = np.abs(mean_axis)
-    dominant_axis_deg = np.mod(0.5 * np.rad2deg(np.angle(mean_axis)), 180.0)
+    mean_shell = np.nanmean(
+        spectra_shell,
+        axis=0,
+    )
+
+    std_shell = np.nanstd(
+        spectra_shell,
+        axis=0,
+    )
+
+    mean_density = np.nanmean(
+        spectra_density,
+        axis=0,
+    )
+
+    std_density = np.nanstd(
+        spectra_density,
+        axis=0,
+    )
+
+    mean_axis = np.nanmean(
+        spectra_axis_complex,
+        axis=0,
+    )
+
+    anisotropy_strength = np.abs(
+        mean_axis
+    )
+
+    dominant_axis_deg = np.mod(
+        0.5
+        * np.rad2deg(
+            np.angle(mean_axis)
+        ),
+        180.0,
+    )
+
+    # ============================================================
+    # 12. ROSE-SPECTRUM TEMPORAL MEAN
+    # ============================================================
 
     if rose_enabled:
-        mean_rose = np.nanmean(rose_snapshots, axis=0)
-        rose_row_sums = np.nansum(mean_rose, axis=1, keepdims=True)
+
+        mean_rose = np.nanmean(
+            rose_snapshots,
+            axis=0,
+        )
+
+        rose_row_sums = np.nansum(
+            mean_rose,
+            axis=1,
+            keepdims=True,
+        )
+
         rose_normalized = np.divide(
             mean_rose,
             rose_row_sums,
-            out=np.full_like(mean_rose, np.nan, dtype=float),
+            out=np.full_like(
+                mean_rose,
+                np.nan,
+                dtype=float,
+            ),
             where=rose_row_sums > 0,
         )
+
     else:
-        mean_rose = np.empty((0, 0))
-        rose_normalized = np.empty((0, 0))
+
+        mean_rose = np.empty(
+            (0, 0)
+        )
+
+        rose_normalized = np.empty(
+            (0, 0)
+        )
+
+    # ============================================================
+    # 13. SNAPSHOT METADATA
+    # ============================================================
 
     if snapshot_index is not None:
-        snapshot_time_index = int(snapshot_index)
+
+        snapshot_time_index = int(
+            snapshot_index
+        )
+
         snapshot_range_start = None
         snapshot_range_end = None
-        snapshot_time_value = box_ds[time_coord].isel(**{time_coord: snapshot_index}).item()
+
+        snapshot_time_value = (
+            layer_ds[time_coord]
+            .isel(
+                {
+                    time_coord:
+                    snapshot_index
+                }
+            )
+            .item()
+        )
 
     elif snapshot_range is not None:
+
         snapshot_time_index = None
-        snapshot_range_start = int(snapshot_range[0])
-        snapshot_range_end = int(snapshot_range[1])
-        snapshot_time_value = f"timesteps {snapshot_range_start}-{snapshot_range_end}"
+
+        snapshot_range_start = int(
+            snapshot_range[0]
+        )
+
+        snapshot_range_end = int(
+            snapshot_range[1]
+        )
+
+        snapshot_time_value = (
+            f"timesteps "
+            f"{snapshot_range_start}-"
+            f"{snapshot_range_end}"
+        )
 
     else:
+
         snapshot_time_index = None
         snapshot_range_start = None
         snapshot_range_end = None
-        snapshot_time_value = "all timesteps"
+        snapshot_time_value = (
+            "all timesteps"
+        )
+
+    # ============================================================
+    # 14. BUILD OUTPUT DATASET
+    # ============================================================
 
     data_vars = {
-        "shell_integrated_spectrum": (("wavenumber",), mean_shell),
-        "shell_integrated_spectrum_std": (("wavenumber",), std_shell),
-        "spectral_density": (("wavenumber",), mean_density),
-        "spectral_density_std": (("wavenumber",), std_density),
-        "dominant_axis_deg": (("wavenumber",), dominant_axis_deg),
-        "anisotropy_strength": (("wavenumber",), anisotropy_strength),
+        "shell_integrated_spectrum": (
+            ("wavenumber",),
+            mean_shell,
+        ),
+        "shell_integrated_spectrum_std": (
+            ("wavenumber",),
+            std_shell,
+        ),
+        "spectral_density": (
+            ("wavenumber",),
+            mean_density,
+        ),
+        "spectral_density_std": (
+            ("wavenumber",),
+            std_density,
+        ),
+        "dominant_axis_deg": (
+            ("wavenumber",),
+            dominant_axis_deg,
+        ),
+        "anisotropy_strength": (
+            ("wavenumber",),
+            anisotropy_strength,
+        ),
     }
 
     coords = {
         "wavenumber": k_centers,
-        "characteristic_length": (("wavenumber",), 1.0 / k_centers),
+        "characteristic_length": (
+            ("wavenumber",),
+            1.0 / k_centers,
+        ),
     }
 
     if rose_enabled:
-        data_vars["rose_spectrum"] = (("scale_band", "rose_angle_deg"), mean_rose)
-        data_vars["rose_spectrum_normalized"] = (("scale_band", "rose_angle_deg"), rose_normalized)
-        coords["scale_band"] = np.array(rose_band_labels, dtype=object)
-        coords["rose_angle_deg"] = rose_angle_centers_deg
 
-    return xr.Dataset(
+        data_vars[
+            "rose_spectrum"
+        ] = (
+            (
+                "scale_band",
+                "rose_angle_deg",
+            ),
+            mean_rose,
+        )
+
+        data_vars[
+            "rose_spectrum_normalized"
+        ] = (
+            (
+                "scale_band",
+                "rose_angle_deg",
+            ),
+            rose_normalized,
+        )
+
+        coords["scale_band"] = (
+            np.array(
+                rose_band_labels,
+                dtype=object,
+            )
+        )
+
+        coords["rose_angle_deg"] = (
+            rose_angle_centers_deg
+        )
+
+    result = xr.Dataset(
         data_vars=data_vars,
         coords=coords,
         attrs={
             "dx_m": dx,
             "dy_m": dy,
-            "domain_Lx_km": Lx / 1000.0,
-            "domain_Ly_km": Ly / 1000.0,
-            "snapshot_time_index": snapshot_time_index,
-            "snapshot_range_start": snapshot_range_start,
-            "snapshot_range_end": snapshot_range_end,
-            "snapshot_time_value": snapshot_time_value,
-            "layer_index": int(layer_index),
-            "depth_dim": depth_dim,
+            "domain_Lx_km":
+                Lx / 1000.0,
+            "domain_Ly_km":
+                Ly / 1000.0,
+            "snapshot_time_index":
+                snapshot_time_index,
+            "snapshot_range_start":
+                snapshot_range_start,
+            "snapshot_range_end":
+                snapshot_range_end,
+            "snapshot_time_value":
+                snapshot_time_value,
+            "layer_index":
+                int(layer_index),
+            "depth_dim":
+                depth_dim,
         },
-    ).dropna(dim="wavenumber", how="all")
+    ).dropna(
+        dim="wavenumber",
+        how="all",
+    )
+
+    ds.close()
+
+    return result
 
 
 
